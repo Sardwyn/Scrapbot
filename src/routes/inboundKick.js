@@ -36,6 +36,9 @@ import {
   recordSwarmParticipation,
 } from "../stores/trustStore.js";
 
+// ✅ Room Intelligence (observer-only)
+import roomIntelStore from "../stores/roomIntelStore.js";
+
 const router = express.Router();
 
 const DRY_RUN_ONLY = String(process.env.SCRAPBOT_DRY_RUN || "").toLowerCase() === "true";
@@ -46,6 +49,179 @@ const ENABLE_COMMAND_CHAT_REPLIES =
 let storesPrimed = false;
 let storesPrimedAt = 0;
 const STORE_REFRESH_MS = 30_000;
+
+// --------------------------------------------
+// ROOM INTEL (observer-only)
+// - Lives alongside inbound ingest, but does NOT influence moderation.
+// - Buckets messages into 5s windows and upserts snapshots into sc_roomintel_snapshots.
+// - Uses intentionally simple register classification for now (v1.5).
+//   You can swap this later for a richer classifier without touching moderation.
+// --------------------------------------------
+const ROOMINTEL_ENABLED = String(process.env.ROOMINTEL_ENABLED || "1") !== "0";
+const ROOMINTEL_BUCKET_MS = 5_000;
+
+// In-memory bucket accumulator per channel
+// key = `${scraplet_user_id}|${platform}|${channel_slug}`
+const roomIntelBuckets = new Map();
+
+function roomIntelKey({ scraplet_user_id, platform, channel_slug }) {
+  return `${Number(scraplet_user_id)}|${String(platform)}|${String(channel_slug)}`;
+}
+
+// VERY lightweight register classifier (v1.5).
+// Goal: good-enough signal without risking moderation correctness.
+// Registers:
+//  r1 = Passive / low intent
+//  r2 = Casual / banter
+//  r3 = Engaged / conversational
+//  r4 = Focused / high intent (questions, instructions)
+//  r5 = Hyped / emoji/emote-only / excitement
+function classifyRegister({ text, emoji_only, emote_only }) {
+  const t = String(text || "").trim();
+  if (!t) return 1;
+
+  if (emoji_only || emote_only) return 5;
+
+  const lower = t.toLowerCase();
+
+  // "Focused" / instructive / investigative
+  if (
+    lower.includes("how do i") ||
+    lower.includes("how to ") ||
+    lower.includes("can you") ||
+    lower.includes("could you") ||
+    lower.includes("help me") ||
+    lower.includes("why ") ||
+    lower.includes("what is") ||
+    lower.includes("what's") ||
+    lower.includes("where ") ||
+    lower.includes("when ")
+  )
+    return 4;
+
+  if (t.includes("?")) return 3;
+
+  // Casual banter markers
+  if (/\b(lol|lmao|rofl|haha|hehe|omg|wtf)\b/i.test(lower)) return 2;
+
+  return 1;
+}
+
+function roomStateFromEI(ei) {
+  const x = Number(ei || 0);
+  if (x >= 80) return "Hyped";
+  if (x >= 60) return "Focused";
+  if (x >= 40) return "Engaged";
+  if (x >= 20) return "Casual";
+  return "Passive";
+}
+
+function pressureFromTripwire(tripwire) {
+  const t = String(tripwire || "").toLowerCase();
+  if (!t) return null;
+  if (t.includes("hot") || t.includes("red")) return 85;
+  if (t.includes("warm") || t.includes("yellow")) return 55;
+  if (t.includes("cool") || t.includes("green")) return 25;
+  return 40; // unknown-but-present
+}
+
+function flushRoomIntelBucket(key, b) {
+  try {
+    if (!b) return;
+
+    const total = b.messages || 0;
+    if (total <= 0) return;
+
+    const w = b.r1 * 0.0 + b.r2 * 0.25 + b.r3 * 0.5 + b.r4 * 0.75 + b.r5 * 1.0;
+
+    const ei = Math.max(0, Math.min(100, Math.round((w / Math.max(1, total)) * 100)));
+
+    const snapshot = {
+      scraplet_user_id: b.scraplet_user_id,
+      platform: b.platform,
+      channel_slug: b.channel_slug,
+      bucket_ts: new Date(b.bucketStartMs),
+      engagement_index: ei,
+      room_state: roomStateFromEI(ei),
+
+      // proportions 0..1
+      r1: total ? b.r1 / total : 0,
+      r2: total ? b.r2 / total : 0,
+      r3: total ? b.r3 / total : 0,
+      r4: total ? b.r4 / total : 0,
+      r5: total ? b.r5 / total : 0,
+
+      messages: total,
+      mpm: Math.round((total * 60_000) / ROOMINTEL_BUCKET_MS), // approx messages per minute
+      pressure: b.pressure ?? null,
+      meta: {
+        tripwire: b.tripwire ?? null,
+      },
+    };
+
+    // Fire-and-forget; store is already try/catch defensive.
+    roomIntelStore.insertSnapshot(snapshot);
+  } catch (e) {
+    console.warn("[roomIntel] flush failed", e?.message || e);
+  }
+}
+
+function roomIntelObserveMessage(event) {
+  if (!ROOMINTEL_ENABLED) return;
+
+  // Only observe real chat text; ignore privileged chatter to reduce creator self-noise.
+  const isPrivileged = event.userRole === "broadcaster" || event.userRole === "mod";
+  if (isPrivileged) return;
+
+  const now = Date.now();
+  const bucketStartMs = Math.floor(now / ROOMINTEL_BUCKET_MS) * ROOMINTEL_BUCKET_MS;
+
+  const key = roomIntelKey({
+    scraplet_user_id: event.scraplet_user_id,
+    platform: event.platform,
+    channel_slug: event.channelSlug,
+  });
+
+  let b = roomIntelBuckets.get(key);
+  if (!b || b.bucketStartMs !== bucketStartMs) {
+    // flush previous
+    if (b) flushRoomIntelBucket(key, b);
+
+    b = {
+      scraplet_user_id: event.scraplet_user_id,
+      platform: event.platform,
+      channel_slug: event.channelSlug,
+      bucketStartMs,
+      messages: 0,
+      r1: 0,
+      r2: 0,
+      r3: 0,
+      r4: 0,
+      r5: 0,
+      tripwire: event.__tripwire ?? null,
+      pressure: pressureFromTripwire(event.__tripwire),
+    };
+
+    roomIntelBuckets.set(key, b);
+  }
+
+  // keep latest tripwire/pressure (read-only hint)
+  b.tripwire = event.__tripwire ?? b.tripwire;
+  b.pressure = pressureFromTripwire(b.tripwire);
+
+  const reg = classifyRegister({
+    text: event.text,
+    emoji_only: !!event?.meta?.emoji_only,
+    emote_only: !!event?.meta?.emote_only,
+  });
+
+  b.messages += 1;
+  if (reg === 1) b.r1 += 1;
+  else if (reg === 2) b.r2 += 1;
+  else if (reg === 3) b.r3 += 1;
+  else if (reg === 4) b.r4 += 1;
+  else b.r5 += 1; // default to r5 if anything odd
+}
 
 async function primeStoresIfNeeded() {
   const now = Date.now();
@@ -188,33 +364,20 @@ function normalizeFromChatV1(chat_v1, root = {}) {
   };
 }
 
-
-
 // Legacy Helper: normalize inbound Kick payloads into a common shape.  <-- Get this the fuck outta dodge asap.
 function normalizeInbound(root = {}) {
-  const eventType = safeStr(
-    root.eventType || root.type || root.kind || "chat.message.sent"
-  );
+  const eventType = safeStr(root.eventType || root.type || root.kind || "chat.message.sent");
 
   // Support wrapper + legacy
   const payload = root.payload || root.data || root || {};
 
   // Message may be object or string depending on source
-  const message =
-    payload.message ||
-    root.message ||
-    null;
+  const message = payload.message || root.message || null;
 
   const raw =
-    (typeof message === "object" && message?.raw) ||
-    payload.message?.raw ||
-    null;
+    (typeof message === "object" && message?.raw) || payload.message?.raw || null;
 
-  const scraplet_user_id =
-    payload.scraplet_user_id ??
-    payload.scrapletUserId ??
-    root.scraplet_user_id ??
-    null;
+  const scraplet_user_id = payload.scraplet_user_id ?? payload.scrapletUserId ?? root.scraplet_user_id ?? null;
 
   // -------- CHANNEL SLUG --------
   const channelSlugCandidate =
@@ -270,11 +433,9 @@ function normalizeInbound(root = {}) {
         null
       : null;
 
-  const payloadMessageString =
-    typeof payload.message === "string" ? payload.message : null;
+  const payloadMessageString = typeof payload.message === "string" ? payload.message : null;
 
-  const rootMessageString =
-    typeof root.message === "string" ? root.message : null;
+  const rootMessageString = typeof root.message === "string" ? root.message : null;
 
   const textCandidate =
     (typeof payload.text === "string" ? payload.text : null) ||
@@ -301,47 +462,49 @@ function normalizeInbound(root = {}) {
 
   const { emoji_only, emote_only } = classifyHypeOnly(text, emotes);
   // -------- MESSAGE ID (reply threading needs Kick UUID, not hash) --------
-function looksLikeUuid(v) {
-  const s = String(v || "").trim();
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
-}
-
-const candidateIds = [
-  // Prefer canonical chat_v1 message id if present
-  root?.chat_v1?.message?.id,
-  payload?.chat_v1?.message?.id,
-
-  // Dashboard legacy message wrapper
-  payload?.message_id,
-  payload?.messageId,
-  root?.message_id,
-  root?.messageId,
-  (typeof message === "object" ? message?.message_id : null),
-
-  // Raw webhook payload paths (these are common)
-  raw?.message?.message_id,
-  raw?.message?.id,
-  raw?.message_id,
-];
-
-let message_id = null;
-for (const c of candidateIds) {
-  const s = c == null ? "" : String(c).trim();
-  if (!s) continue;
-  if (looksLikeUuid(s)) {
-    message_id = s;
-    break;
+  function looksLikeUuid(v) {
+    const s = String(v || "").trim();
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      s
+    );
   }
-}
 
-// If we didn’t find a UUID, keep a fallback id around for logging/debug,
-// but DO NOT use it for reply threading.
-if (!message_id) {
-  const fallback =
-    candidateIds.map((x) => (x == null ? "" : String(x).trim())).find(Boolean) || null;
-  message_id = fallback;
-}
+  const candidateIds = [
+    // Prefer canonical chat_v1 message id if present
+    root?.chat_v1?.message?.id,
+    payload?.chat_v1?.message?.id,
 
+    // Dashboard legacy message wrapper
+    payload?.message_id,
+    payload?.messageId,
+    root?.message_id,
+    root?.messageId,
+    typeof message === "object" ? message?.message_id : null,
+
+    // Raw webhook payload paths (these are common)
+    raw?.message?.message_id,
+    raw?.message?.id,
+    raw?.message_id,
+  ];
+
+  let message_id = null;
+  for (const c of candidateIds) {
+    const s = c == null ? "" : String(c).trim();
+    if (!s) continue;
+    if (looksLikeUuid(s)) {
+      message_id = s;
+      break;
+    }
+  }
+
+  // If we didn’t find a UUID, keep a fallback id around for logging/debug,
+  // but DO NOT use it for reply threading.
+  if (!message_id) {
+    const fallback =
+      candidateIds.map((x) => (x == null ? "" : String(x).trim())).find(Boolean) ||
+      null;
+    message_id = fallback;
+  }
 
   // -------- BADGES --------
   const badges =
@@ -367,12 +530,12 @@ if (!message_id) {
   };
 }
 
-
-
 function resolveUserRole({ payload, senderUserId, broadcasterUserId, badges }) {
   // Broadcaster check
   const isBroadcaster =
-    (senderUserId != null && broadcasterUserId != null && String(senderUserId) === String(broadcasterUserId)) ||
+    (senderUserId != null &&
+      broadcasterUserId != null &&
+      String(senderUserId) === String(broadcasterUserId)) ||
     payload?.isBroadcaster === true;
 
   // Mod check (badges can be ["moderator"] or object-ish)
@@ -455,16 +618,16 @@ router.post("/api/inbound/kick", async (req, res) => {
   const expected = process.env.SCRAPBOT_SHARED_SECRET;
 
   // DEBUG: verify ChatEnvelopeV1 arrives from Dashboard
-if (req.body?.chat_v1) {
-  const c = req.body.chat_v1;
-  console.log("[inboundKick] chat_v1 received", {
-    v: c.v,
-    platform: c.platform,
-    channel: c.channel?.slug,
-    author: c.author?.username,
-    text: c.message?.text?.slice(0, 80),
-  });
-}
+  if (req.body?.chat_v1) {
+    const c = req.body.chat_v1;
+    console.log("[inboundKick] chat_v1 received", {
+      v: c.v,
+      platform: c.platform,
+      channel: c.channel?.slug,
+      author: c.author?.username,
+      text: c.message?.text?.slice(0, 80),
+    });
+  }
 
   if (expected) {
     const provided = req.headers["x-scrapbot-secret"];
@@ -483,64 +646,74 @@ if (req.body?.chat_v1) {
   let commandReplySent = false;
 
   // DEBUG: verify if Kick emotes/reactions are present in the inbound payload
-try {
-  const b = req.body || {};
-  const msg = b.message || b.data || b.payload || b; // defensive: depends how dashboard forwards
-  console.log(
-    '[inboundKick][debug] topKeys=',
-    Object.keys(b),
-    'msgKeys=',
-    msg && typeof msg === 'object' ? Object.keys(msg) : typeof msg
-  );
-  console.log(
-    '[inboundKick][debug] text=',
-    JSON.stringify(msg?.text ?? msg?.message ?? msg?.content ?? b?.text ?? b?.message ?? ''),
-    'emotes=',
-    Array.isArray(msg?.emotes) ? msg.emotes.length : (Array.isArray(b?.emotes) ? b.emotes.length : null),
-    'reactions=',
-    Array.isArray(msg?.reactions) ? msg.reactions.length : (Array.isArray(b?.reactions) ? b.reactions.length : null)
-  );
-} catch (e) {
-  console.log('[inboundKick][debug] log failed', e?.message || e);
-}
-
+  try {
+    const b = req.body || {};
+    const msg = b.message || b.data || b.payload || b; // defensive: depends how dashboard forwards
+    console.log(
+      "[inboundKick][debug] topKeys=",
+      Object.keys(b),
+      "msgKeys=",
+      msg && typeof msg === "object" ? Object.keys(msg) : typeof msg
+    );
+    console.log(
+      "[inboundKick][debug] text=",
+      JSON.stringify(msg?.text ?? msg?.message ?? msg?.content ?? b?.text ?? b?.message ?? ""),
+      "emotes=",
+      Array.isArray(msg?.emotes)
+        ? msg.emotes.length
+        : Array.isArray(b?.emotes)
+        ? b.emotes.length
+        : null,
+      "reactions=",
+      Array.isArray(msg?.reactions)
+        ? msg.reactions.length
+        : Array.isArray(b?.reactions)
+        ? b.reactions.length
+        : null
+    );
+  } catch (e) {
+    console.log("[inboundKick][debug] log failed", e?.message || e);
+  }
 
   try {
     const body = req.body || {};
-const inbound = body.chat_v1
-  ? normalizeFromChatV1(body.chat_v1, body)
-  : normalizeInbound(body);
+    const inbound = body.chat_v1
+      ? normalizeFromChatV1(body.chat_v1, body)
+      : normalizeInbound(body);
 
+    // DEBUG: show normalized inbound too
+    try {
+      console.log("[inboundKick][debug] normalized keys=", Object.keys(inbound || {}));
+      console.log(
+        "[inboundKick][debug] normalized text=",
+        JSON.stringify(inbound?.text || ""),
+        "rootKeys=",
+        inbound?.root && typeof inbound.root === "object"
+          ? Object.keys(inbound.root)
+          : typeof inbound.root,
+        "payloadKeys=",
+        inbound?.payload && typeof inbound.payload === "object"
+          ? Object.keys(inbound.payload)
+          : typeof inbound.payload
+      );
 
-// DEBUG: show normalized inbound too
-try {
-  console.log(
-    '[inboundKick][debug] normalized keys=',
-    Object.keys(inbound || {})
-  );
-  console.log(
-    '[inboundKick][debug] normalized text=',
-    JSON.stringify(inbound?.text || ''),
-    'rootKeys=',
-    inbound?.root && typeof inbound.root === 'object' ? Object.keys(inbound.root) : typeof inbound.root,
-    'payloadKeys=',
-    inbound?.payload && typeof inbound.payload === 'object' ? Object.keys(inbound.payload) : typeof inbound.payload
-  );
-
-  // Look for emote-ish arrays in normalized root/payload
-  const p = inbound?.payload || {};
-  const r = inbound?.root || {};
-  console.log(
-    '[inboundKick][debug] normalized emote candidates=',
-    'payload.emotes=', Array.isArray(p?.emotes) ? p.emotes.length : null,
-    'payload.reactions=', Array.isArray(p?.reactions) ? p.reactions.length : null,
-    'root.emotes=', Array.isArray(r?.emotes) ? r.emotes.length : null,
-    'root.reactions=', Array.isArray(r?.reactions) ? r.reactions.length : null
-  );
-} catch (e) {
-  console.log('[inboundKick][debug] normalized log failed', e?.message || e);
-}
-
+      // Look for emote-ish arrays in normalized root/payload
+      const p = inbound?.payload || {};
+      const r = inbound?.root || {};
+      console.log(
+        "[inboundKick][debug] normalized emote candidates=",
+        "payload.emotes=",
+        Array.isArray(p?.emotes) ? p.emotes.length : null,
+        "payload.reactions=",
+        Array.isArray(p?.reactions) ? p.reactions.length : null,
+        "root.emotes=",
+        Array.isArray(r?.emotes) ? r.emotes.length : null,
+        "root.reactions=",
+        Array.isArray(r?.reactions) ? r.reactions.length : null
+      );
+    } catch (e) {
+      console.log("[inboundKick][debug] normalized log failed", e?.message || e);
+    }
 
     const {
       eventType,
@@ -564,7 +737,9 @@ try {
       eventType === "message";
 
     if (!isChatEvent) {
-      return res.status(200).json({ ok: true, ignored: true, reason: "non_chat_event", eventType });
+      return res
+        .status(200)
+        .json({ ok: true, ignored: true, reason: "non_chat_event", eventType });
     }
 
     if (!scraplet_user_id || !channelSlug) {
@@ -598,36 +773,35 @@ try {
     };
 
     // --------------------------------------------
-// SYSTEM COMMANDS (e.g. !tts)
-// --------------------------------------------
-try {
-  const handled = await tryHandleSystemCommand(event);
-  if (handled) {
-    metricsRecordInbound({
-      platform: event.platform,
-      channelSlug: event.channelSlug,
-      scraplet_user_id: event.scraplet_user_id,
-      userRole: event.userRole,
-      senderUsername: event.senderUsername,
-      senderUserId: event.senderUserId,
-      eventType,
-      message_id: event.message_id,
-      pulse,
-      tripwire,
-      floodDecision: null,
-      swarmDecision: null,
-      moderationDecision: null,
-      commandDecision: "system:tts",
-      commandReplySent: false,
-      error: null,
-    });
+    // SYSTEM COMMANDS (e.g. !tts)
+    // --------------------------------------------
+    try {
+      const handled = await tryHandleSystemCommand(event);
+      if (handled) {
+        metricsRecordInbound({
+          platform: event.platform,
+          channelSlug: event.channelSlug,
+          scraplet_user_id: event.scraplet_user_id,
+          userRole: event.userRole,
+          senderUsername: event.senderUsername,
+          senderUserId: event.senderUserId,
+          eventType,
+          message_id: event.message_id,
+          pulse,
+          tripwire,
+          floodDecision: null,
+          swarmDecision: null,
+          moderationDecision: null,
+          commandDecision: "system:tts",
+          commandReplySent: false,
+          error: null,
+        });
 
-    return res.status(200).json({ ok: true, systemCommand: true });
-  }
-} catch (e) {
-  console.error("[systemCommand] failed", e?.message || e);
-}
-
+        return res.status(200).json({ ok: true, systemCommand: true });
+      }
+    } catch (e) {
+      console.error("[systemCommand] failed", e?.message || e);
+    }
 
     // --------------------------------------------
     // Channel pulse tracking (tripwire input)
@@ -638,17 +812,20 @@ try {
       pulse = null;
     } else {
       pulse = channelPulseTrack({
-      platform: "kick",
-      channelSlug: event.channelSlug,
-      scraplet_user_id: event.scraplet_user_id,
-      senderUserId: event.senderUserId,
-      senderUsername: event.senderUsername,
-    });
+        platform: "kick",
+        channelSlug: event.channelSlug,
+        scraplet_user_id: event.scraplet_user_id,
+        senderUserId: event.senderUserId,
+        senderUsername: event.senderUsername,
+      });
     }
 
     // whatever your pulse returns, we store it for guards
     tripwire = pulse?.tripwire || pulse?.trip || pulse?.state || null;
     event.__tripwire = tripwire;
+
+    // RoomIntel observer (write point)
+    roomIntelObserveMessage(event);
 
     // --------------------------------------------
     // Trust: record "seen" + early hostile precheck
@@ -672,11 +849,8 @@ try {
         // Guard: emoji-only messages should never trigger hostile-floor actions
 
         if (event.meta && event.meta.emoji_only === true) {
-
           throw Object.assign(new Error("emoji_only_skip_hostile"), { __skip_hostile: true });
-
         }
-
 
         const hostile = await shouldAutoHostileAction({
           platform: "kick",
@@ -739,15 +913,14 @@ try {
             results,
           });
         }
-     } catch (e) {
-  if (e && e.__skip_hostile) {
-    // Intentional skip for emoji/emote-only hype
-    console.log("[trust] skipped hostile-floor (emoji/emote-only)");
-  } else {
-    console.warn("[trust] shouldAutoHostileAction failed", e?.message || e);
-  }
-}
-
+      } catch (e) {
+        if (e && e.__skip_hostile) {
+          // Intentional skip for emoji/emote-only hype
+          console.log("[trust] skipped hostile-floor (emoji/emote-only)");
+        } else {
+          console.warn("[trust] shouldAutoHostileAction failed", e?.message || e);
+        }
+      }
     }
 
     // --------------------------------------------
@@ -942,7 +1115,7 @@ try {
     }
 
     // --------------------------------------------
-// --------------------------------------------
+    // --------------------------------------------
     // COMMAND REPLY (optional)
     // --------------------------------------------
     // Forensics note:
@@ -977,7 +1150,10 @@ try {
 
       // Array-of-lines case
       if (Array.isArray(decision.lines)) {
-        const joined = decision.lines.map((x) => (x == null ? "" : String(x))).join("\n").trim();
+        const joined = decision.lines
+          .map((x) => (x == null ? "" : String(x)))
+          .join("\n")
+          .trim();
         if (joined) return joined;
       }
 
@@ -1011,7 +1187,10 @@ try {
 
         if (matchedHint) {
           console.warn("[inboundKick][commands] matched but no reply text extracted", {
-            keys: commandDecision && typeof commandDecision === "object" ? Object.keys(commandDecision).slice(0, 40) : null,
+            keys:
+              commandDecision && typeof commandDecision === "object"
+                ? Object.keys(commandDecision).slice(0, 40)
+                : null,
             decision: commandDecision,
           });
         }
@@ -1039,7 +1218,7 @@ try {
         commandReplySent = !!r?.ok;
       }
     }
-// ---- metrics + ring buffer (in-memory)
+    // ---- metrics + ring buffer (in-memory)
     metricsRecordInbound({
       platform: event.platform,
       channelSlug: event.channelSlug,
