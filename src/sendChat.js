@@ -34,12 +34,20 @@ async function resolveKickAccessToken(explicit) {
 
 /**
  * Public API used throughout the repo.
+ *
+ * IMPORTANT: broadcasterUserId is REQUIRED for ALL Kick sends.
+ * kickChatSend requires broadcaster_user_id — there is no
+ * token-bound "bot-mode" routing.  If broadcasterUserId is
+ * missing the call is rejected with a warn log.
  */
 export async function sendKickChatMessage({
   channelSlug, // kept for logging / parity
   text,
   replyToMessageId = null,
-  type = "bot", // default to bot
+
+  // Default to "user".  Callers may pass "bot" for slash-commands.
+  type = "user",
+
   broadcasterUserId = null,
 
   // optional explicit token injection
@@ -48,24 +56,50 @@ export async function sendKickChatMessage({
   const outText = String(text || "").trim();
   if (!outText) return { ok: false, status: 0, error: "missing_text" };
 
+  // broadcasterUserId is mandatory — kickChatSend will reject without it.
+  if (!broadcasterUserId) {
+    console.warn("[sendChat] missing broadcasterUserId — cannot send", {
+      channelSlug: channelSlug || null,
+    });
+    return { ok: false, status: 0, error: "missing_broadcaster_user_id" };
+  }
+
+  // ✅ DRY RUN ENFORCEMENT
+  if (arguments[0]?.dryRun) {
+    console.log("[sendChat] DRY_RUN: skipping real send", { channelSlug, text: outText });
+    return { ok: true, dryRun: true, status: 200, data: "DRY_RUN_OK" };
+  }
+
+  const resolvedType = type || "user";
+
   const { token, source } = await resolveKickAccessToken(accessToken);
 
   console.log("[sendChat] kick token source", {
     channelSlug: channelSlug || null,
     source,
     hasToken: !!token,
-    type,
+    type: resolvedType,
     hasBroadcasterUserId: !!broadcasterUserId,
   });
 
-  // kickChatSend will validate token/broadcaster/text again, but this makes failures obvious
   if (!token) return { ok: false, status: 0, error: "missing_kick_access_token" };
 
-  return await kickChatSend({
+  const resp = await kickChatSend({
     accessToken: token,
     broadcasterUserId,
     content: outText,
-    type,
+    type: resolvedType,
     replyToMessageId,
   });
+
+  console.log("[sendChat] kickChatSend result", {
+    ok: resp?.ok,
+    status: resp?.status,
+    data:
+      resp?.data
+        ? (typeof resp.data === "string" ? resp.data.slice(0, 200) : resp.data)
+        : null,
+  });
+
+  return resp;
 }

@@ -12,6 +12,7 @@
 
 import { sendKickChatMessage } from './sendChat.js';
 import { q } from './lib/db.js';
+import fetch from 'node-fetch';
 
 import { kickBanOrTimeout, kickDeleteChatMessage } from './lib/kickModeration.js';
 import { recordIncident } from './stores/intelStore.js';
@@ -117,6 +118,38 @@ async function isDbDryRun({ scraplet_user_id, platform }) {
   }
 }
 
+const _sessionCache = new Map();
+
+async function getSessionForModeration(platform, channelSlug) {
+  if (!platform || !channelSlug) return null;
+  const key = `${platform}:${channelSlug}`;
+  const now = Date.now();
+  const cached = _sessionCache.get(key);
+  if (cached && cached.expires > now) {
+    return cached.sessionId;
+  }
+
+  try {
+    const internalKey = String(process.env.SCRAPLET_INTERNAL_KEY || "");
+    const url = `http://127.0.0.1:3030/api/internal/session/current?platform=${encodeURIComponent(platform)}&channel=${encodeURIComponent(channelSlug)}`;
+
+    const resp = await fetch(url, {
+      headers: { 'x-scraplet-internal-key': internalKey }
+    });
+    if (!resp.ok) {
+      _sessionCache.set(key, { sessionId: null, expires: now + 30000 });
+      return null;
+    }
+    const data = await resp.json();
+    const sessionId = data.session_id || null;
+    _sessionCache.set(key, { sessionId, expires: now + 30000 });
+    return sessionId;
+  } catch (err) {
+    _sessionCache.set(key, { sessionId: null, expires: now + 30000 });
+    return null;
+  }
+}
+
 async function logModerationEvent({
   scraplet_user_id,
   platform,
@@ -133,18 +166,20 @@ async function logModerationEvent({
   action,
   duration_seconds,
 }) {
+  const sessionId = await getSessionForModeration(platform, channel_slug);
+
   try {
     await q(
       `
       INSERT INTO public.scrapbot_moderation_events (
-        scraplet_user_id, platform, channel_slug,
+        scraplet_user_id, platform, channel_slug, session_id,
         sender_username, sender_user_id, user_role,
         message_id, message_text,
         matched, rule_id, rule_type, rule_value,
         action, duration_seconds
       )
       VALUES (
-        $1,$2,$3,
+        $1,$2,$3,$15,
         $4,$5,$6,
         $7,$8,
         $9,$10,$11,$12,
@@ -170,6 +205,7 @@ async function logModerationEvent({
 
         action ? String(action) : null,
         duration_seconds != null ? Number(duration_seconds) : null,
+        sessionId,
       ]
     );
   } catch (e) {
@@ -209,6 +245,9 @@ export async function executeModerationAction({
   const act = normalizeAction(action);
   let enforcement = getEnforcementMode();
   const t0 = Date.now();
+
+  // ✅ DRY RUN ENFORCEMENT
+  if (arguments[0]?.dryRun) enforcement = 'off';
 
   // Optional DB latch
   const dbDry = await isDbDryRun({ scraplet_user_id, platform });
@@ -260,7 +299,7 @@ export async function executeModerationAction({
       actions: { action: effectiveAction, duration_seconds: effectiveDuration || 0, delete_message: !!delete_message },
       meta: { message_id: message_id || null, enforcement, db_dry_run: dbDry, rule_type, rule_id, rule_value: rule_value || signature_hash || null },
     });
-  } catch {}
+  } catch { }
 
   async function finalizeResult() {
     try {
@@ -292,7 +331,7 @@ export async function executeModerationAction({
           rule_value: rule_value || signature_hash || null,
         },
       });
-    } catch {}
+    } catch { }
   }
 
   if (platform !== 'kick') {
@@ -462,10 +501,20 @@ export async function executeModerationAction({
       return result;
     }
 
+    if (!broadcasterUserId) {
+      console.warn('[moderationActions] chat-command fallback skipped: missing broadcasterUserId', { channelSlug, cmd });
+      result.steps.push({ step: 'chat_command', ok: false, cmd, error: 'missing_broadcaster_user_id' });
+      result.ok = false;
+      result.error = 'missing_broadcaster_user_id';
+      await finalizeResult();
+      return result;
+    }
+
     try {
       await sendKickChatMessage({
         broadcasterUserId: broadcasterUserId,
-        messageText: cmd,
+        channelSlug: channelSlug || null,
+        text: cmd,
         type: 'bot',
       });
       result.steps.push({ step: 'chat_command', ok: true, cmd });

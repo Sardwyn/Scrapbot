@@ -95,7 +95,7 @@ async function emitDashboardEvent({ url, body }) {
 export function startRaffleOrchestrator() {
   if (envStr('RAFFLE_ORCHESTRATOR_ENABLED', '1') === '0') {
     console.log('[raffleOrch] disabled via env');
-    return { stop() {} };
+    return { stop() { } };
   }
 
   const PULL_URL =

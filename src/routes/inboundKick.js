@@ -10,7 +10,7 @@
 
 import express from "express";
 import { channelPulseTrack } from "../lib/channelPulse.js";
-import { metricsRecordInbound } from "../lib/metrics.js";
+import { metricsRecordInbound, metricsRecordAudit } from "../lib/metrics.js";
 import { tryHandleSystemCommand } from "../systemCommands.js";
 import { evaluateModeration } from "../moderationRuntime.js";
 import { evaluateChatCommand } from "../commandRuntime.js";
@@ -28,6 +28,10 @@ import { sendKickChatMessage } from "../sendChat.js";
 // Flood guard export differs across versions; import module and probe.
 import * as floodGuard from "../lib/floodGuard.js";
 
+import { q } from "../lib/db.js";
+
+const SCRAPBOT_STRICT_CHAT_V1 = String(process.env.SCRAPBOT_STRICT_CHAT_V1 || "false").toLowerCase() === "true"; // Default conservatively until fully deployed
+
 // ✅ Trust system
 import {
   recordSeen,
@@ -44,6 +48,51 @@ const router = express.Router();
 const DRY_RUN_ONLY = String(process.env.SCRAPBOT_DRY_RUN || "").toLowerCase() === "true";
 const ENABLE_COMMAND_CHAT_REPLIES =
   String(process.env.SCRAPBOT_COMMAND_REPLIES || "true").toLowerCase() !== "false";
+
+// --------------------------------------------
+// ✅ SELF-REPLY LOOP GUARD (NO LATENCY)
+// If dashboard mirrors Scrapbot's own chat back into this endpoint,
+// Scrapbot must ignore its own authored messages or it will loop forever.
+// --------------------------------------------
+const SCRAPBOT_IGNORE_SELF =
+  String(process.env.SCRAPBOT_IGNORE_SELF ?? "true").toLowerCase() === "true";
+
+const SCRAPBOT_SELF_USERNAME = String(process.env.SCRAPBOT_SELF_USERNAME || "")
+  .trim()
+  .toLowerCase();
+
+const SCRAPBOT_SELF_USER_ID = String(process.env.SCRAPBOT_SELF_USER_ID || "").trim();
+
+function isSelfAuthored({ senderUsername, senderUserId, payload }) {
+  if (!SCRAPBOT_IGNORE_SELF) return false;
+
+  const u = String(senderUsername || "").trim().toLowerCase();
+  const id = String(senderUserId || "").trim();
+
+  // Prefer ID match if set
+  if (SCRAPBOT_SELF_USER_ID && id && id === SCRAPBOT_SELF_USER_ID) return true;
+
+  // Username match if set
+  if (SCRAPBOT_SELF_USERNAME && u && u === SCRAPBOT_SELF_USERNAME) return true;
+
+  // Extra safety: some upstreams mark bot messages explicitly
+  // (cheap checks, avoids loops even if username/id not configured perfectly)
+  try {
+    const p = payload || {};
+    const hinted =
+      p?.type === "bot" ||
+      p?.senderType === "bot" ||
+      p?.is_bot === true ||
+      p?.isBot === true ||
+      p?.bot === true ||
+      p?.author?.is_bot === true ||
+      p?.author?.isBot === true;
+
+    return !!hinted;
+  } catch {
+    return false;
+  }
+}
 
 // Store priming / refresh (prevents DB reload on every inbound message)
 let storesPrimed = false;
@@ -289,7 +338,7 @@ function isEmoteOnly(text, emotes) {
   if (!tokens.every(isEmoteToken)) return false;
 
   // Tight heuristic: if Kick told us there are emotes, and the message is basically just tokens,
-  // treat it as emote-only hype. Keep it tight to avoid misclassifying normal sentences.
+  // treat as emote-only hype. Keep it tight to avoid misclassifying normal sentences.
   const maxTokens = Math.max(3, emotes.length + 2);
   return tokens.length <= maxTokens;
 }
@@ -330,10 +379,10 @@ function normalizeFromChatV1(chat_v1, root = {}) {
 
   const senderUsername = safeStr(
     c.author?.username ??
-      c.author?.display ??
-      payload.senderUsername ??
-      payload.sender_username ??
-      ""
+    c.author?.display ??
+    payload.senderUsername ??
+    payload.sender_username ??
+    ""
   );
 
   const senderUserId =
@@ -346,7 +395,15 @@ function normalizeFromChatV1(chat_v1, root = {}) {
 
   const message_id = c.id ?? payload.message_id ?? payload.messageId ?? null;
 
-  const badges = c.author?.badges ?? null;
+  const role = safeStr(c.author?.role || "").toLowerCase();
+
+  let badges = c.author?.badges ?? null;
+
+  // If Kick chat_v1 gives us role but no badges, synthesize a moderator badge
+  if ((!badges || (Array.isArray(badges) && badges.length === 0)) && role) {
+    if (role === "mod" || role === "moderator") badges = ["moderator"];
+    if (role === "broadcaster") badges = ["broadcaster"];
+  }
 
   return {
     eventType: "chat.message.sent",
@@ -359,12 +416,12 @@ function normalizeFromChatV1(chat_v1, root = {}) {
     text,
     message_id,
     badges,
-    meta: { from_chat_v1: true },
+    meta: { from_chat_v1: true, authorRole: safeStr(c.author?.role || "").toLowerCase() },
     root,
   };
 }
 
-// Legacy Helper: normalize inbound Kick payloads into a common shape.  <-- Get this the fuck outta dodge asap.
+// Legacy Helper: normalize inbound Kick payloads into a common shape.
 function normalizeInbound(root = {}) {
   const eventType = safeStr(root.eventType || root.type || root.kind || "chat.message.sent");
 
@@ -428,9 +485,9 @@ function normalizeInbound(root = {}) {
   const messageTextFromMessageObject =
     typeof message === "object"
       ? (typeof message?.content === "string" ? message.content : null) ||
-        (typeof message?.text === "string" ? message.text : null) ||
-        (typeof message?.message === "string" ? message.message : null) ||
-        null
+      (typeof message?.text === "string" ? message.text : null) ||
+      (typeof message?.message === "string" ? message.message : null) ||
+      null
       : null;
 
   const payloadMessageString = typeof payload.message === "string" ? payload.message : null;
@@ -530,7 +587,7 @@ function normalizeInbound(root = {}) {
   };
 }
 
-function resolveUserRole({ payload, senderUserId, broadcasterUserId, badges }) {
+function resolveUserRole({ payload, senderUserId, broadcasterUserId, badges, meta }) {
   // Broadcaster check
   const isBroadcaster =
     (senderUserId != null &&
@@ -543,15 +600,20 @@ function resolveUserRole({ payload, senderUserId, broadcasterUserId, badges }) {
   const badgeText = Array.isArray(b) ? b.map((x) => safeStr(x).toLowerCase()) : [];
   const badgeObj = b && typeof b === "object" && !Array.isArray(b) ? b : null;
 
+  // chat_v1 events carry author.role but often have null badges
+  const metaRole = safeStr(meta?.authorRole || "").toLowerCase();
+
   const isMod =
     payload?.isModerator === true ||
     badgeText.includes("moderator") ||
     badgeText.includes("mod") ||
     badgeObj?.moderator === true ||
-    badgeObj?.mod === true;
+    badgeObj?.mod === true ||
+    metaRole === "mod" ||
+    metaRole === "moderator";
 
   if (isBroadcaster) return "broadcaster";
-  if (isMod) return "mod";
+  if (isMod) return "moderator";
   return "everyone";
 }
 
@@ -581,7 +643,7 @@ function pruneFlood() {
   if (typeof floodGuard.pruneFloodState === "function") {
     try {
       floodGuard.pruneFloodState(Date.now());
-    } catch {}
+    } catch { }
   }
 }
 
@@ -625,7 +687,12 @@ router.post("/api/inbound/kick", async (req, res) => {
       platform: c.platform,
       channel: c.channel?.slug,
       author: c.author?.username,
-      text: c.message?.text?.slice(0, 80),
+      authorKeys: c.author && typeof c.author === "object" ? Object.keys(c.author) : null,
+      badges: c.author?.badges ?? null,
+      identityBadges: c.author?.identity?.badges ?? null,
+      identity: c.author?.identity ?? null,
+      senderId: c.author?.platform_user_id ?? c.author?.id ?? null,
+      text: c.message?.text?.slice(0, 120),
     });
   }
 
@@ -662,14 +729,14 @@ router.post("/api/inbound/kick", async (req, res) => {
       Array.isArray(msg?.emotes)
         ? msg.emotes.length
         : Array.isArray(b?.emotes)
-        ? b.emotes.length
-        : null,
+          ? b.emotes.length
+          : null,
       "reactions=",
       Array.isArray(msg?.reactions)
         ? msg.reactions.length
         : Array.isArray(b?.reactions)
-        ? b.reactions.length
-        : null
+          ? b.reactions.length
+          : null
     );
   } catch (e) {
     console.log("[inboundKick][debug] log failed", e?.message || e);
@@ -677,9 +744,99 @@ router.post("/api/inbound/kick", async (req, res) => {
 
   try {
     const body = req.body || {};
+
+    // Phase 3: Strict chat_v1 enforcement
+    if (SCRAPBOT_STRICT_CHAT_V1) {
+      const chat_v1 = body?.chat_v1;
+      if (!chat_v1 || typeof chat_v1 !== "object") {
+        const clientIp = req.ip || req.headers["x-forwarded-for"] || "unknown";
+        console.error(
+          "[inboundKick] STRICT MODE: rejected request without chat_v1",
+          { clientIp, hasChatV1: !!chat_v1 }
+        );
+        return res.status(400).json({
+          ok: false,
+          error: "chat_v1_required",
+          message: "SCRAPBOT_STRICT_CHAT_V1 mode enabled: chat_v1 field is required",
+        });
+      }
+
+      if (!chat_v1.platform || !chat_v1.scraplet_user_id || !chat_v1.message) {
+        return res.status(400).json({
+          ok: false,
+          error: "invalid_chat_v1",
+          message: "chat_v1 missing required fields",
+        });
+      }
+    }
+
+    // Phase 4: Validated Idempotency / Dedupe
+    if (body.chat_v1) {
+      const c1 = body.chat_v1;
+      const eventId = c1.event_id;
+
+      // SCRAPBOT_STRICT_CHAT_V1 implies event_id is MUST
+      if (SCRAPBOT_STRICT_CHAT_V1 && !eventId) {
+        return res.status(400).json({
+          ok: false,
+          error: "event_id_required",
+          message: "Strict mode requires chat_v1.event_id"
+        });
+      }
+
+      if (eventId) {
+        try {
+          const { rowCount } = await q(`
+              INSERT INTO public.processed_events (event_id, platform, channel_slug, message_id)
+              VALUES ($1, $2, $3, $4)
+              ON CONFLICT (event_id) DO NOTHING
+          `, [
+            eventId,
+            c1.platform || 'kick',
+            c1.channel?.slug || null,
+            c1.message?.id || null
+          ]);
+
+          if (rowCount === 0) {
+            console.log(`[inboundKick] DUPLICATE event ignored: ${eventId}`);
+            return res.json({ ok: true, deduped: true });
+          }
+        } catch (dbErr) {
+          console.error("[inboundKick] Dedupe check failed", dbErr);
+          // Fail closed to prevent double side-effects
+          return res.status(500).json({ ok: false, error: "dedupe_check_failed" });
+        }
+      }
+    }
+
     const inbound = body.chat_v1
       ? normalizeFromChatV1(body.chat_v1, body)
       : normalizeInbound(body);
+
+    if (body?.chat_v1) {
+      console.log("[kick][roleProbe]", {
+        channel: inbound?.channelSlug,
+        user: inbound?.senderUsername,
+        senderUserId: inbound?.senderUserId,
+        author_role: body.chat_v1?.author?.role ?? null,
+        badges: inbound?.badges ?? null,
+      });
+    }
+
+    // ✅ SELF LOOP GUARD — must happen AFTER normalization so we catch both payload styles
+    if (isSelfAuthored({
+      senderUsername: inbound?.senderUsername,
+      senderUserId: inbound?.senderUserId,
+      payload: inbound?.payload
+    })) {
+      console.log("[inboundKick] ignoring self-authored message", {
+        senderUsername: inbound?.senderUsername,
+        senderUserId: inbound?.senderUserId,
+        channelSlug: inbound?.channelSlug,
+        message_id: inbound?.message_id || null,
+      });
+      return res.status(200).json({ ok: true, ignored: true, reason: "self_message" });
+    }
 
     // DEBUG: show normalized inbound too
     try {
@@ -752,7 +909,7 @@ router.post("/api/inbound/kick", async (req, res) => {
 
     await primeStoresIfNeeded();
 
-    const userRole = resolveUserRole({ payload, senderUserId, broadcasterUserId, badges });
+    const userRole = resolveUserRole({ payload, senderUserId, broadcasterUserId, badges, meta });
 
     const results = [];
 
@@ -1115,7 +1272,6 @@ router.post("/api/inbound/kick", async (req, res) => {
     }
 
     // --------------------------------------------
-    // --------------------------------------------
     // COMMAND REPLY (optional)
     // --------------------------------------------
     // Forensics note:
@@ -1194,11 +1350,12 @@ router.post("/api/inbound/kick", async (req, res) => {
             decision: commandDecision,
           });
         }
-      } catch (_) {}
+      } catch (_) { }
     }
 
     if (ENABLE_COMMAND_CHAT_REPLIES && replyText && safeStr(replyText).trim()) {
       const out = safeStr(replyText).trim();
+
       if (DRY_RUN_ONLY) {
         results.push({ dryRun: true, label: "command_reply", text: out });
         commandReplySent = true;
@@ -1207,17 +1364,27 @@ router.post("/api/inbound/kick", async (req, res) => {
         // (kickChatSend will also validate; this just makes intent explicit.)
         const replyTo = event.message_id || null;
 
+        //TEMP: forensics log to verify we have the right context to send a reply (channelSlug, broadcasterUserId, scraplet_user_id)
+
+        console.log('[commands] send reply', {
+          channelSlug: event.channelSlug,
+          broadcasterUserId: event.broadcasterUserId,
+          senderUsername: event.senderUsername,
+          message_id: event.message_id,
+        });
+
         const r = await sendKickChatMessage({
           channelSlug: event.channelSlug,
           text: out,
           replyToMessageId: replyTo,
-          type: "bot",
+          type: "user",
           broadcasterUserId: event.broadcasterUserId ? Number(event.broadcasterUserId) : null,
         });
         results.push({ label: "command_reply", result: r });
         commandReplySent = !!r?.ok;
       }
     }
+
     // ---- metrics + ring buffer (in-memory)
     metricsRecordInbound({
       platform: event.platform,
@@ -1236,6 +1403,24 @@ router.post("/api/inbound/kick", async (req, res) => {
       commandDecision,
       commandReplySent,
       error: null,
+    });
+
+    // ---- audit ring (detailed decision log)
+    metricsRecordAudit({
+      event_id: body?.chat_v1?.event_id || null,
+      message_id: event.message_id,
+      channelSlug: event.channelSlug,
+      senderUsername: event.senderUsername,
+      senderUserId: event.senderUserId,
+      userRole: event.userRole,
+      text_preview: event.text,
+      floodDecision,
+      swarmDecision,
+      moderationDecision,
+      commandDecision,
+      trustDecision: null,
+      actions_attempted: results.filter(r => r.label).map(r => r.label),
+      actions_results: results,
     });
 
     return res.status(200).json({
@@ -1259,7 +1444,14 @@ router.post("/api/inbound/kick", async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("[inboundKick] error:", err);
+    console.error("[inboundKick] error:", {
+      msg: String(err?.message || err),
+      stack: String(err?.stack || ""),
+      channelSlug: event?.channelSlug || inbound?.channelSlug || null,
+      senderUsername: event?.senderUsername || inbound?.senderUsername || null,
+      senderUserId: event?.senderUserId || inbound?.senderUserId || null,
+      scraplet_user_id: event?.scraplet_user_id || inbound?.scraplet_user_id || null,
+    });
 
     // Record failure (best-effort)
     try {
@@ -1281,7 +1473,7 @@ router.post("/api/inbound/kick", async (req, res) => {
         commandReplySent,
         error: String(err?.message || err),
       });
-    } catch {}
+    } catch { }
 
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }

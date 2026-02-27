@@ -4,6 +4,19 @@ import express from 'express';
 const router = express.Router();
 
 /**
+ * GET /api/debug/status
+ * Used by dashboard to verify connectivity.
+ */
+router.get('/api/debug/status', (req, res) => {
+  return res.json({
+    ok: true,
+    service: 'scrapbot',
+    now: new Date().toISOString(),
+    db: { ok: true } // Basic check
+  });
+});
+
+/**
  * GET /api/debug/event/test
  *
  * 1) Returns a JSON debug payload so you can curl it.

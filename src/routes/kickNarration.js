@@ -132,7 +132,7 @@ router.post("/api/integrations/kick/narrate", requireNarrationAuth, async (req, 
       broadcasterUserId,
       messageText: msg,
       replyToMessageId: reply_to_message_id || null,
-      type: "bot",
+      type: "user",
     });
 
     if (!sendResult?.ok) {

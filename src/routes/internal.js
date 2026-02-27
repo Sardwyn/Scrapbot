@@ -3,6 +3,7 @@ import express from "express";
 import { loadAllCommands } from "../commandStore.js";
 import { sendKickChatMessage } from "../sendChat.js";
 import { kickBanOrTimeout } from "../lib/kickModeration.js";
+import { q } from "../lib/db.js";
 
 const router = express.Router();
 router.use(express.json());
@@ -58,8 +59,9 @@ router.post("/send-chat", requireInternal, async (req, res) => {
   const b = req.body || {};
   const broadcasterUserId = b.broadcasterUserId ?? b.broadcaster_user_id ?? null;
   const messageText = b.messageText ?? b.text ?? "";
+  const channelSlug = String(b.channelSlug ?? b.channel_slug ?? "").toLowerCase().trim() || null;
   const replyToMessageId = b.replyToMessageId ?? b.reply_to_message_id ?? null;
-  const type = b.type || "bot";
+  const type = b.type || "user";
 
   if (!broadcasterUserId || !String(messageText || "").trim()) {
     return res.status(400).json({
@@ -71,7 +73,8 @@ router.post("/send-chat", requireInternal, async (req, res) => {
   try {
     const out = await sendKickChatMessage({
       broadcasterUserId,
-      messageText,
+      channelSlug,
+      text: messageText,
       replyToMessageId,
       type,
     });
@@ -129,6 +132,47 @@ router.post("/verify-mod", requireInternal, async (req, res) => {
       status: 0,
       error: err?.message || String(err),
     });
+  }
+});
+
+/**
+ * POST /api/internal/set-broadcaster-id
+ * body: { channelSlug, broadcasterUserId }
+ *
+ * Dashboard backfill worker calls this after resolving a broadcaster
+ * id for a channel that was missing it.
+ */
+router.post("/set-broadcaster-id", requireInternal, async (req, res) => {
+  const b = req.body || {};
+  const channelSlug = String(b.channelSlug || b.channel_slug || "").toLowerCase().trim();
+  const bId = Number(b.broadcasterUserId ?? b.broadcaster_user_id ?? 0) || 0;
+
+  if (!channelSlug || !bId) {
+    return res.status(400).json({
+      ok: false,
+      error: "channelSlug and broadcasterUserId are required",
+    });
+  }
+
+  try {
+    const result = await q(
+      `UPDATE public.scrapbot_accounts
+       SET broadcaster_user_id = $2, updated_at = now()
+       WHERE platform = 'kick' AND channel_id = $1
+         AND (broadcaster_user_id IS NULL OR broadcaster_user_id != $2)`,
+      [channelSlug, bId]
+    );
+
+    console.log("[internal] set-broadcaster-id", {
+      channelSlug,
+      broadcasterUserId: bId,
+      rowCount: result?.rowCount ?? 0,
+    });
+
+    return res.json({ ok: true, updated: result?.rowCount ?? 0 });
+  } catch (err) {
+    console.error("[internal] /set-broadcaster-id failed", err);
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 

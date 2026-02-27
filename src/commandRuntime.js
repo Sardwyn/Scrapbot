@@ -25,23 +25,72 @@ function isRoleAllowed(cmdRole, userRole) {
 
 /**
  * Very small template expansion for {user} and {channel}
- * Supports either plain string payload or { text: "..." } object.
+ * Also supports $1..$9, $args, and simple DSL functions.
  */
-function renderTextTemplate(payload, { userName, channelSlug }) {
+function renderTextTemplate(payload, { userName, channelSlug, args = [] }) {
   if (!payload) return null;
 
-  const raw =
+  let raw =
     typeof payload === 'string'
       ? payload
       : typeof payload.text === 'string'
-      ? payload.text
-      : null;
+        ? payload.text
+        : null;
 
   if (!raw) return null;
 
-  return raw
+  // 1. Static {user} / {channel}
+  raw = raw
     .replace(/\{user\}/g, userName || '')
     .replace(/\{channel\}/g, channelSlug || '');
+
+  // 2. Arguments $1..$9
+  for (let i = 1; i <= 9; i++) {
+    const re = new RegExp(`\\$${i}`, 'g');
+    raw = raw.replace(re, args[i - 1] || '');
+  }
+
+  // 3. $args (all arguments joined)
+  raw = raw.replace(/\$args/g, args.join(' '));
+
+  // 4. DSL: $random(a,b,c)
+  raw = raw.replace(/\$random\(([^)]+)\)/g, (match, choicesStr) => {
+    const choices = choicesStr.split(',').map((s) => s.trim());
+    if (!choices.length) return '';
+    return choices[Math.floor(Math.random() * choices.length)];
+  });
+
+  // 5. DSL: Case manipulation
+  raw = raw.replace(/\$tolower\(([^)]+)\)/g, (match, inner) => inner.toLowerCase());
+  raw = raw.replace(/\$toupper\(([^)]+)\)/g, (match, inner) => inner.toUpperCase());
+
+  return raw.trim();
+}
+
+/**
+ * Convert a matched command match result into a set of actions (v2).
+ */
+function resultToActions(cmd, { userName, channelSlug, args = [] }) {
+  const actions = [];
+  const responseType = (cmd.response_type || 'text').toLowerCase();
+
+  if (responseType === 'text') {
+    const textOut = renderTextTemplate(cmd.response_payload, {
+      userName,
+      channelSlug,
+      args,
+    });
+
+    if (textOut) {
+      actions.push({
+        type: 'chat',
+        text: textOut,
+      });
+    }
+  }
+
+  // Future: dispatch other types (overlay, tts, etc.) from cmd.response_payload
+  return actions;
 }
 
 /**
@@ -116,6 +165,24 @@ export async function evaluateChatCommand({
 
     if (!matched) continue;
 
+    // Argument extraction (split rest of message)
+    // For prefix matches, args are whatever follows the trigger
+    let args = [];
+    if (triggerType === 'prefix') {
+      const triggerUsed = triggerLower.startsWith('!') ? triggerLower : '!' + triggerLower;
+      const rest = text.slice(textLower.indexOf(triggerUsed) + triggerUsed.length).trim();
+      if (rest) args = rest.split(/\s+/);
+    } else if (triggerType === 'regex') {
+      try {
+        const re = new RegExp(triggerRaw, 'i');
+        const matchResult = text.match(re);
+        if (matchResult) {
+          // regex groups are arguments
+          args = matchResult.slice(1);
+        }
+      } catch { }
+    }
+
     // Role gating
     if (!isRoleAllowed(cmd.role, userRole)) {
       continue;
@@ -127,45 +194,50 @@ export async function evaluateChatCommand({
       const last = lastUsed.get(cmd.id) || 0;
       const elapsed = (now - last) / 1000;
       if (elapsed < cooldownSeconds) {
-        continue; // still cooling down
+        // Return a denied result with cooldown info for tracing
+        return {
+          matched: true,
+          denied: true,
+          reason: 'cooldown',
+          remaining_seconds: Math.ceil(cooldownSeconds - elapsed),
+          command: { id: cmd.id, name: cmd.name },
+          actions: [],
+        };
       }
     }
 
-    const responseType = (cmd.response_type || 'text').toLowerCase();
+    const actions = resultToActions(cmd, { userName, channelSlug, args });
 
-    if (responseType === 'text') {
-      const textOut = renderTextTemplate(cmd.response_payload, {
-        userName,
-        channelSlug,
-      });
-
-      if (!textOut) {
-        console.log('[commands] matched command but empty payload', {
-          id: cmd.id,
-          name: cmd.name,
-          payload: cmd.response_payload,
-        });
-        continue;
-      }
-
-      if (cooldownSeconds > 0) {
-        lastUsed.set(cmd.id, now);
-      }
-
-      console.log('[commands] matched command', {
+    if (actions.length === 0) {
+      console.log('[commands] matched command but produced no actions', {
         id: cmd.id,
         name: cmd.name,
-        trigger_type: cmd.trigger_type,
-        trigger_pattern: cmd.trigger_pattern,
       });
-
-      return {
-        type: 'text',
-        text: textOut,
-      };
+      continue;
     }
 
-    // Future: other response types (events, overlays, etc.)
+    if (cooldownSeconds > 0) {
+      lastUsed.set(cmd.id, now);
+    }
+
+    console.log('[commands] matched command', {
+      id: cmd.id,
+      name: cmd.name,
+      trigger_type: cmd.trigger_type,
+      trigger_pattern: cmd.trigger_pattern,
+      actions_count: actions.length,
+    });
+
+    return {
+      matched: true,
+      command_id: cmd.id,
+      name: cmd.name,
+      actions,
+      args,
+      // Back-compat: existing code expects .type and .text if it's a simple text reply
+      type: actions[0].type === 'chat' ? 'text' : null,
+      text: actions[0].type === 'chat' ? actions[0].text : null,
+    };
   }
 
   console.log('[commands] no matching command for', text);

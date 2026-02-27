@@ -1,5 +1,9 @@
 // src/lib/refreshKick.js
+// BOT TOKEN ONLY — do not use for user tokens
 // Bot-only Kick OAuth refresh for Scrapbot (uses scrapbot_clean.kick_tokens_bot)
+// Dashboard owns user OAuth; Scrapbot owns bot OAuth
+// This is part of this system: src/lib/refreshKick.js - src/workers/refresh.js - src/routes/botKickAuth.js (PKCE flow)
+
 
 import axios from 'axios';
 import { q } from './db.js';

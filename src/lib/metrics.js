@@ -48,6 +48,7 @@ const counters = new Map(); // key -> number
 const gauges = new Map(); // key -> { value, ts }
 const pulseLatest = new Map(); // channelKey -> { pulse, tripwire, ts }
 const ring = new RingBuffer(Number(process.env.SCRAPBOT_METRICS_RING_SIZE || 500) || 500);
+const commandTraceRing = new RingBuffer(Number(process.env.SCRAPBOT_COMMAND_TRACE_SIZE || 100) || 100);
 
 function inc(key, by = 1) {
   const k = String(key);
@@ -353,5 +354,82 @@ export function metricsRecent({ limit = 200, order = "newest" } = {}) {
     now: new Date().toISOString(),
     order: ord,
     items,
+  };
+}
+
+// -------------------------------------------------------------------
+// Audit ring buffer — detailed moderation decision records
+// -------------------------------------------------------------------
+const auditRing = new RingBuffer(
+  Number(process.env.SCRAPBOT_AUDIT_RING_SIZE || 100) || 100
+);
+
+export function metricsRecordAudit({
+  test_run_id = null,
+  event_id = null,
+  message_id = null,
+  channelSlug = null,
+  senderUsername = null,
+  senderUserId = null,
+  userRole = null,
+  text_preview = null,
+  floodDecision = null,
+  swarmDecision = null,
+  moderationDecision = null,
+  commandDecision = null,
+  trustDecision = null,
+  actions_attempted = [],
+  actions_results = [],
+} = {}) {
+  auditRing.push({
+    ts: nowMs(),
+    test_run_id: test_run_id || null,
+    event_id: event_id || null,
+    message_id: message_id || null,
+    channelSlug: channelSlug || null,
+    senderUsername: senderUsername || null,
+    senderUserId: senderUserId != null ? String(senderUserId) : null,
+    userRole: userRole || null,
+    text_preview: String(text_preview || "").slice(0, 120),
+    flood: floodDecision || null,
+    swarm: swarmDecision || null,
+    moderation: moderationDecision || null,
+    command: commandDecision || null,
+    trust: trustDecision || null,
+    actions_attempted: actions_attempted || [],
+    actions_results: actions_results || [],
+  });
+}
+
+export function metricsAuditRecent({ limit = 50, channelSlug = null } = {}) {
+  let items = auditRing.newestFirst(200);
+  if (channelSlug) {
+    const slug = String(channelSlug).toLowerCase().trim();
+    items = items.filter(it => it && String(it.channelSlug || "").toLowerCase().trim() === slug);
+  }
+  return {
+    ok: true,
+    service: "scrapbot",
+    now: new Date().toISOString(),
+    items: items.slice(0, Math.min(Math.max(1, Number(limit) || 50), 200)),
+  };
+}
+
+// -------------------------------------------------------------------
+// Command Trace ring buffer — detailed command execution records
+// -------------------------------------------------------------------
+export function metricsRecordCommandTrace(trace) {
+  commandTraceRing.push({
+    ts: nowMs(),
+    ...trace
+  });
+}
+
+export function metricsGetRecentCommandTraces({ limit = 20 } = {}) {
+  return {
+    ok: true,
+    service: "scrapbot",
+    now: new Date().toISOString(),
+    items: commandTraceRing.newestFirst(Math.min(Math.max(1, Number(limit) || 20), 100)),
   };
 }

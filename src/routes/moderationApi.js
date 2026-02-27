@@ -7,6 +7,9 @@ import { channelPulseTrack } from '../lib/channelPulse.js';
 import { evaluateSwarm } from '../moderation/swarmGuard.js';
 import { shouldAutoHostileAction } from '../stores/trustStore.js';
 
+// ✅ NEW: reload moderation cache after writes so UI changes take effect immediately
+import { reloadModerationRulesForUser } from '../moderationStore.js';
+
 const router = express.Router();
 
 function asInt(v, fallback = null) {
@@ -28,7 +31,6 @@ function normChannelSlug(v) {
   const s = String(v).trim().toLowerCase().replace(/^@+/, "");
   return s ? s : null;
 }
-
 
 function getSessionUserId(req) {
   // Try a bunch of common shapes without assuming your auth middleware.
@@ -54,6 +56,27 @@ function getUserIdFrom(req, explicitId) {
   const n = Number(explicitId);
   if (Number.isFinite(n) && n > 0) return n;
   return getSessionUserId(req);
+}
+
+// ✅ NEW: centralised cache reload (never fails the API response if reload fails)
+async function reloadModerationCache(scraplet_user_id, platform, why) {
+  const uid = Number(scraplet_user_id);
+  const plat = String(platform || 'kick').toLowerCase();
+
+  if (!Number.isFinite(uid) || uid <= 0) return;
+
+  try {
+    await reloadModerationRulesForUser(uid, plat);
+    console.log('[moderationApi] cache reloaded', { scraplet_user_id: uid, platform: plat, why });
+  } catch (e) {
+    // Do not fail the write response if cache reload fails; log loudly.
+    console.error('[moderationApi] cache reload FAILED', {
+      scraplet_user_id: uid,
+      platform: plat,
+      why,
+      error: e?.message || String(e),
+    });
+  }
 }
 
 // -------------------------
@@ -100,7 +123,6 @@ router.get('/api/moderation/rules', async (req, res) => {
   }
 });
 
-
 router.post('/api/moderation/rules', async (req, res) => {
   try {
     const b = req.body || {};
@@ -132,6 +154,9 @@ router.post('/api/moderation/rules', async (req, res) => {
       `,
       [scraplet_user_id, platform, rule_type, rule_value, action, duration_seconds, enabled, channel_slug, ignore_mods, priority]
     );
+
+    // ✅ Apply immediately
+    await reloadModerationCache(scraplet_user_id, platform, 'rules:create');
 
     return res.json({ ok: true, rule: rows[0] });
   } catch (err) {
@@ -172,16 +197,15 @@ router.put('/api/moderation/rules/:id', async (req, res) => {
         setParts.push(`${k} = $${i++}`);
         values.push(asBool(v, false));
       } else if (k === 'action') {
-  setParts.push(`${k} = $${i++}`);
-  values.push(String(v || '').trim().toLowerCase());
-} else if (k === 'channel_slug') {
-  setParts.push(`${k} = $${i++}`);
-  values.push(normChannelSlug(v));
-} else {
-  setParts.push(`${k} = $${i++}`);
-  values.push(String(v || '').trim());
-}
-
+        setParts.push(`${k} = $${i++}`);
+        values.push(String(v || '').trim().toLowerCase());
+      } else if (k === 'channel_slug') {
+        setParts.push(`${k} = $${i++}`);
+        values.push(normChannelSlug(v));
+      } else {
+        setParts.push(`${k} = $${i++}`);
+        values.push(String(v || '').trim());
+      }
     }
 
     if (setParts.length === 0) {
@@ -204,6 +228,11 @@ router.put('/api/moderation/rules/:id', async (req, res) => {
 
     if (!rows[0]) return res.status(404).json({ ok: false, error: 'rule not found' });
 
+    // ✅ Apply immediately (need scope; use body if present, otherwise fallback to row)
+    const scraplet_user_id = getUserIdFrom(req, asInt(b.scraplet_user_id)) || rows[0]?.scraplet_user_id;
+    const platform = String(b.platform || rows[0]?.platform || 'kick').toLowerCase();
+    await reloadModerationCache(scraplet_user_id, platform, 'rules:update');
+
     return res.json({ ok: true, rule: rows[0] });
   } catch (err) {
     console.error('[moderationApi] update rule error', err);
@@ -216,7 +245,18 @@ router.delete('/api/moderation/rules/:id', async (req, res) => {
     const id = asInt(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
 
+    // ✅ fetch scope BEFORE delete so we can reload correctly
+    const pre = await db.query(
+      `SELECT scraplet_user_id, platform FROM public.scrapbot_moderation_rules WHERE id = $1`,
+      [id]
+    );
+    const scope = pre.rows?.[0] || null;
+
     await db.query(`DELETE FROM public.scrapbot_moderation_rules WHERE id = $1`, [id]);
+
+    if (scope?.scraplet_user_id) {
+      await reloadModerationCache(scope.scraplet_user_id, scope.platform || 'kick', 'rules:delete');
+    }
 
     return res.json({ ok: true });
   } catch (err) {
@@ -457,6 +497,9 @@ router.put('/api/moderation/settings', async (req, res) => {
 
     clearSettingsCache(scraplet_user_id, platform);
 
+    // ✅ keep behavior “immediate”: reload rule cache too (cheap + predictable)
+    await reloadModerationCache(scraplet_user_id, platform, 'settings:update');
+
     const settings = await getModerationSettings(scraplet_user_id, platform);
     return res.json({ ok: true, settings, raw: rows[0] });
   } catch (err) {
@@ -585,14 +628,15 @@ router.put('/api/moderation/overrides', async (req, res) => {
       [scraplet_user_id, platform, signature_hash, mode, note, enabled]
     );
 
+    // ✅ Apply immediately (even if overrides are read elsewhere, reloading rules is cheap & consistent)
+    await reloadModerationCache(scraplet_user_id, platform, 'overrides:upsert');
+
     return res.json({ ok: true, override: rows[0] });
   } catch (err) {
     console.error('[moderationApi] override upsert error', err);
     return res.status(500).json({ ok: false, error: err.message || 'internal error' });
   }
 });
-
-
 
 // -----------------------------
 // Runtime toggles (admin only)
