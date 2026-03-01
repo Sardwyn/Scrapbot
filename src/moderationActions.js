@@ -12,7 +12,6 @@
 
 import { sendKickChatMessage } from './sendChat.js';
 import { q } from './lib/db.js';
-import fetch from 'node-fetch';
 
 import { kickBanOrTimeout, kickDeleteChatMessage } from './lib/kickModeration.js';
 import { recordIncident } from './stores/intelStore.js';
