@@ -441,8 +441,8 @@ router.put('/api/moderation/settings', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'scraplet_user_id required' });
     }
 
-    // Upsert settings row and update fields
     const payload = {
+      // Flood
       flood_enabled: asBool(b.flood_enabled, true),
       flood_window_seconds: asInt(b.flood_window_seconds, 10),
       flood_max_messages: asInt(b.flood_max_messages, 5),
@@ -452,6 +452,24 @@ router.put('/api/moderation/settings', async (req, res) => {
       flood_escalate_multiplier: asInt(b.flood_escalate_multiplier, 2),
       flood_max_duration_seconds: asInt(b.flood_max_duration_seconds, 600),
       flood_cooldown_seconds: asInt(b.flood_cooldown_seconds, 120),
+
+      // Swarm / Shield Guard
+      swarm_enabled: asBool(b.swarm_enabled, true),
+      swarm_window_seconds: asInt(b.swarm_window_seconds, 10),
+      swarm_min_unique_users: asInt(b.swarm_min_unique_users, 6),
+      swarm_min_repeats: asInt(b.swarm_min_repeats, 8),
+      swarm_cooldown_seconds: asInt(b.swarm_cooldown_seconds, 120),
+      swarm_action: String(b.swarm_action || 'timeout').toLowerCase(),
+      swarm_duration_seconds: asInt(b.swarm_duration_seconds, 30),
+      swarm_promote_global: asBool(b.swarm_promote_global, true),
+      swarm_promote_confidence: Number(b.swarm_promote_confidence) || 0.75,
+      sig_lowercase: asBool(b.sig_lowercase, true),
+      sig_strip_punct: asBool(b.sig_strip_punct, true),
+      sig_collapse_ws: asBool(b.sig_collapse_ws, true),
+      sig_strip_emojis: asBool(b.sig_strip_emojis, false),
+      swarm_escalate: asBool(b.swarm_escalate, true),
+      swarm_escalate_repeat_threshold: asInt(b.swarm_escalate_repeat_threshold, 2),
+      swarm_escalate_action: String(b.swarm_escalate_action || 'ban').toLowerCase(),
     };
 
     const { rows } = await db.query(
@@ -460,11 +478,21 @@ router.put('/api/moderation/settings', async (req, res) => {
         (scraplet_user_id, platform,
          flood_enabled, flood_window_seconds, flood_max_messages, flood_action, flood_duration_seconds,
          flood_escalate, flood_escalate_multiplier, flood_max_duration_seconds, flood_cooldown_seconds,
+         swarm_enabled, swarm_window_seconds, swarm_min_unique_users, swarm_min_repeats,
+         swarm_cooldown_seconds, swarm_action, swarm_duration_seconds,
+         swarm_promote_global, swarm_promote_confidence,
+         sig_lowercase, sig_strip_punct, sig_collapse_ws, sig_strip_emojis,
+         swarm_escalate, swarm_escalate_repeat_threshold, swarm_escalate_action,
          updated_at)
       VALUES
         ($1,$2,
          $3,$4,$5,$6,$7,
          $8,$9,$10,$11,
+         $12,$13,$14,$15,
+         $16,$17,$18,
+         $19,$20,
+         $21,$22,$23,$24,
+         $25,$26,$27,
          NOW())
       ON CONFLICT (scraplet_user_id)
       DO UPDATE SET
@@ -478,6 +506,22 @@ router.put('/api/moderation/settings', async (req, res) => {
         flood_escalate_multiplier = EXCLUDED.flood_escalate_multiplier,
         flood_max_duration_seconds = EXCLUDED.flood_max_duration_seconds,
         flood_cooldown_seconds = EXCLUDED.flood_cooldown_seconds,
+        swarm_enabled = EXCLUDED.swarm_enabled,
+        swarm_window_seconds = EXCLUDED.swarm_window_seconds,
+        swarm_min_unique_users = EXCLUDED.swarm_min_unique_users,
+        swarm_min_repeats = EXCLUDED.swarm_min_repeats,
+        swarm_cooldown_seconds = EXCLUDED.swarm_cooldown_seconds,
+        swarm_action = EXCLUDED.swarm_action,
+        swarm_duration_seconds = EXCLUDED.swarm_duration_seconds,
+        swarm_promote_global = EXCLUDED.swarm_promote_global,
+        swarm_promote_confidence = EXCLUDED.swarm_promote_confidence,
+        sig_lowercase = EXCLUDED.sig_lowercase,
+        sig_strip_punct = EXCLUDED.sig_strip_punct,
+        sig_collapse_ws = EXCLUDED.sig_collapse_ws,
+        sig_strip_emojis = EXCLUDED.sig_strip_emojis,
+        swarm_escalate = EXCLUDED.swarm_escalate,
+        swarm_escalate_repeat_threshold = EXCLUDED.swarm_escalate_repeat_threshold,
+        swarm_escalate_action = EXCLUDED.swarm_escalate_action,
         updated_at = NOW()
       RETURNING *
       `,
@@ -492,6 +536,22 @@ router.put('/api/moderation/settings', async (req, res) => {
         payload.flood_escalate_multiplier,
         payload.flood_max_duration_seconds,
         payload.flood_cooldown_seconds,
+        payload.swarm_enabled,
+        payload.swarm_window_seconds,
+        payload.swarm_min_unique_users,
+        payload.swarm_min_repeats,
+        payload.swarm_cooldown_seconds,
+        payload.swarm_action,
+        payload.swarm_duration_seconds,
+        payload.swarm_promote_global,
+        payload.swarm_promote_confidence,
+        payload.sig_lowercase,
+        payload.sig_strip_punct,
+        payload.sig_collapse_ws,
+        payload.sig_strip_emojis,
+        payload.swarm_escalate,
+        payload.swarm_escalate_repeat_threshold,
+        payload.swarm_escalate_action,
       ]
     );
 
@@ -659,7 +719,7 @@ router.post('/api/moderation/runtime', (req, res) => {
   const usePulseTripwire = b.usePulseTripwire;
 
   if (enforcement) {
-    if (!['off','timeout_only','full'].includes(enforcement)) {
+    if (!['off', 'timeout_only', 'full'].includes(enforcement)) {
       return res.status(400).json({ ok: false, error: 'enforcement must be off|timeout_only|full' });
     }
     globalThis.__scrapbot_enforcement = enforcement;
@@ -757,10 +817,10 @@ router.post('/api/moderation/pipeline_test', async (req, res) => {
     // Determine winner in the same order as live pipeline
     const winner =
       (trust && trust.matched) ? 'trust' :
-      (swarm && swarm.matched) ? 'swarm' :
-      (flood) ? 'flood' :
-      (rules) ? 'rules' :
-      'none';
+        (swarm && swarm.matched) ? 'swarm' :
+          (flood) ? 'flood' :
+            (rules) ? 'rules' :
+              'none';
 
     return res.json({
       ok: true,

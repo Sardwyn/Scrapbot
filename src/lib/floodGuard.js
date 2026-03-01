@@ -94,6 +94,24 @@ export async function getModerationSettings(scraplet_user_id, platform = "kick")
     flood_escalate_multiplier: coerceInt(s.flood_escalate_multiplier, 2),
     flood_max_duration_seconds: coerceInt(s.flood_max_duration_seconds, 600),
     flood_cooldown_seconds: coerceInt(s.flood_cooldown_seconds, 120),
+
+    // Swarm / Shield Guard
+    swarm_enabled: coerceBool(s.swarm_enabled, true),
+    swarm_window_seconds: coerceInt(s.swarm_window_seconds, 10),
+    swarm_min_unique_users: coerceInt(s.swarm_min_unique_users, 6),
+    swarm_min_repeats: coerceInt(s.swarm_min_repeats, 8),
+    swarm_cooldown_seconds: coerceInt(s.swarm_cooldown_seconds, 120),
+    swarm_action: String(s.swarm_action || "timeout").toLowerCase(),
+    swarm_duration_seconds: coerceInt(s.swarm_duration_seconds, 30),
+    swarm_promote_global: coerceBool(s.swarm_promote_global, true),
+    swarm_promote_confidence: Number(s.swarm_promote_confidence) || 0.75,
+    sig_lowercase: coerceBool(s.sig_lowercase, true),
+    sig_strip_punct: coerceBool(s.sig_strip_punct, true),
+    sig_collapse_ws: coerceBool(s.sig_collapse_ws, true),
+    sig_strip_emojis: coerceBool(s.sig_strip_emojis, false),
+    swarm_escalate: coerceBool(s.swarm_escalate, true),
+    swarm_escalate_repeat_threshold: coerceInt(s.swarm_escalate_repeat_threshold, 2),
+    swarm_escalate_action: String(s.swarm_escalate_action || "ban").toLowerCase(),
   };
 
   settingsCache.set(key, { settings, expiresAt: t + SETTINGS_TTL_MS });
