@@ -1,4 +1,5 @@
 // src/intel/registerClassifier.js
+import { isEmojiOnly } from '../lib/textSig.js';
 // Deterministic register classifier (1..5) for live chat messages.
 // - Fast: string/regex + tiny token tables
 // - Stateless: no DB, no external calls
@@ -124,19 +125,6 @@ function clamp(n, min, max) {
 
 function normalizeText(text) {
   return (text || "").trim();
-}
-
-function isEmojiOnly(text) {
-  // Best-effort heuristic. We treat “emoji-only” as low register by default.
-  // This doesn’t need to be perfect; it’s just to avoid over-scoring hype spam.
-  const t = normalizeText(text);
-  if (!t) return true;
-
-  // If it contains any letter/number, it's not emoji-only.
-  if (/[A-Za-z0-9]/.test(t)) return false;
-
-  // Contains at least one non-whitespace char.
-  return /\S/.test(t);
 }
 
 function tokenize(text) {

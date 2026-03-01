@@ -1,41 +1,5 @@
-// moderationRuntime.js
 import { getModerationRulesFor } from './moderationStore.js';
-
-// Strip emoji/pictographs so rules don't punish normal emoji hype.
-// Best-effort: if the runtime doesn't support Unicode property escapes, we keep the original.
-function stripEmoji(text) {
-  const s = String(text || '');
-  try {
-    // Extended_Pictographic covers most emoji. Also remove variation selectors + ZWJ.
-    // We keep whitespace so word boundaries still behave.
-    return s
-      .replace(/\p{Extended_Pictographic}/gu, '')
-      .replace(/[\uFE0F\u200D]/g, '')
-      .trim();
-  } catch {
-    return s.trim();
-  }
-}
-
-// A message is "emoji-only" if stripping emoji removes everything meaningful.
-function isEmojiOnly(text) {
-  const raw = String(text || '').trim();
-  if (!raw) return false;
-
-  // If it has letters/numbers, it's not emoji-only.
-  if (/[a-z0-9]/i.test(raw)) return false;
-
-  const noEmoji = stripEmoji(raw);
-  // If after stripping emoji/ZWJ/VS we have nothing but punctuation/space, treat as emoji-only.
-  if (!noEmoji) return true;
-  try {
-    const meaningful = noEmoji.replace(/[\s\p{P}\p{S}]/gu, '');
-    return meaningful.length === 0;
-  } catch {
-    // If unicode classes unavailable, fall back to ascii heuristic.
-    return !/[a-z0-9]/i.test(noEmoji);
-  }
-}
+import { stripEmoji, isEmojiOnly } from './lib/textSig.js';
 
 /**
  * Evaluate a chat message against moderation rules.

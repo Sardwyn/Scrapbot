@@ -1,5 +1,5 @@
 // /var/www/scrapbot/src/moderation/swarmGuard.js
-import { capsRatio, hasUrl, normalizeExact, normalizeFuzzy, hashSig } from '../lib/textSig.js';
+import { capsRatio, hasUrl, normalizeExact, normalizeFuzzy, hashSig, isEmojiOnly } from '../lib/textSig.js';
 import { recordIncident, upsertGlobalSignatureIntel } from '../stores/intelStore.js';
 import { q } from '../lib/db.js';
 
@@ -165,6 +165,9 @@ export async function evaluateSwarm(event) {
 
   const text = String(event.text || '');
   if (text.length < (settings.swarm_min_message_length || 8)) return { matched: false, actions: [] };
+
+  // ✅ Exclude emoji-only messages from triggering or participating in swarm shields
+  if (isEmojiOnly(text)) return { matched: false, actions: [] };
 
   // --- Canonical fingerprints ---
   // IMPORTANT: We enforce ONLY on exact canonical duplicates.

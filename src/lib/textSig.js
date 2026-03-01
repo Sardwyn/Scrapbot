@@ -38,3 +38,30 @@ export function capsRatio(text) {
 export function hasUrl(text) {
   return /https?:\/\/\S+|www\.\S+/i.test(String(text || ''));
 }
+
+export function stripEmoji(text) {
+  const s = String(text || '');
+  try {
+    return s
+      .replace(/\p{Extended_Pictographic}/gu, '')
+      .replace(/[\uFE0F\u200D]/g, '')
+      .trim();
+  } catch {
+    return s.trim();
+  }
+}
+
+export function isEmojiOnly(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return false;
+  if (/[a-z0-9]/i.test(raw)) return false;
+  const noEmoji = stripEmoji(raw);
+  if (!noEmoji) return true;
+  try {
+    const meaningful = noEmoji.replace(/[\s\p{P}\p{S}]/gu, '');
+    return meaningful.length === 0;
+  } catch {
+    return !/[a-z0-9]/i.test(noEmoji);
+  }
+}
+
