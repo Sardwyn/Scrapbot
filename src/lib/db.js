@@ -2,10 +2,17 @@
 import dotenv from 'dotenv';
 import pg from 'pg';
 
+import { fileURLToPath } from 'url';
+import path from 'path';
+
 const { Pool } = pg;
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const repoRoot = path.resolve(__dirname, '..', '..');
+
 // Load env for BOTH main app & workers, regardless of CWD
-dotenv.config({ path: '/var/www/scrapbot/.env' });
+dotenv.config({ path: path.join(repoRoot, '.env') });
 
 const url = process.env.DATABASE_URL;
 
