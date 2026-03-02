@@ -67,6 +67,28 @@ function roomStateFromEI(ei) {
     return "Passive";
 }
 
+export function getLiveSnapshot(params) {
+    const key = roomIntelKey(params);
+    const b = roomIntelBuckets.get(key);
+    if (!b) return null;
+
+    const total = b.messages || 0;
+    const w = b.r1 * 0.0 + b.r2 * 0.25 + b.r3 * 0.5 + b.r4 * 0.75 + b.r5 * 1.0;
+    const ei = total > 0 ? Math.max(0, Math.min(100, Math.round((w / total) * 100))) : 0;
+
+    return {
+        scraplet_user_id: b.scraplet_user_id,
+        platform: b.platform,
+        channel_slug: b.channel_slug,
+        bucket_ts: new Date(b.bucketStartMs),
+        engagement_index: ei,
+        room_state: roomStateFromEI(ei),
+        messages: total,
+        mpm: Math.round((total * 60_000) / ROOMINTEL_BUCKET_MS),
+        pressure: b.pressure ?? null,
+    };
+}
+
 function pressureFromTripwire(tripwire) {
     const t = String(tripwire || "").toLowerCase();
     if (!t) return null;
@@ -179,4 +201,5 @@ export function observe(event) {
 
 export default {
     observe,
+    getLiveSnapshot,
 };

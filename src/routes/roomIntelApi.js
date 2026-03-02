@@ -9,7 +9,7 @@
 //
 
 import express from "express";
-import roomIntelEngine from "../intel/roomIntelEngine.js";
+import RoomIntelService from "../services/RoomIntelService.js";
 import roomIntelStore from "../stores/roomIntelStore.js";
 
 const router = express.Router();
@@ -46,7 +46,7 @@ router.get("/live", (req, res) => {
   const p = requireChannelParams(req, res);
   if (!p) return;
 
-  const snap = roomIntelEngine.getLiveSnapshot(p);
+  const snap = RoomIntelService.getLiveSnapshot(p);
 
   res.json({
     ok: true,
