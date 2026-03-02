@@ -145,9 +145,9 @@ function flushRoomIntelBucket(key, b) {
 export function observe(event) {
     if (!ROOMINTEL_ENABLED) return;
 
-    // Only observe real chat text; ignore privileged chatter to reduce creator self-noise.
-    const isPrivileged = event.userRole === "broadcaster" || event.userRole === "mod";
-    if (isPrivileged) return;
+    // Ingests a normalized event into the Room Intel pipeline.
+    // In v1.7, we count all users (including broadcaster/mods) to ensure the "Pulse"
+    // reflects total room energy and allows easier testing for creators.
 
     const now = Date.now();
     const bucketStartMs = Math.floor(now / ROOMINTEL_BUCKET_MS) * ROOMINTEL_BUCKET_MS;
