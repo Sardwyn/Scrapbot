@@ -13,6 +13,10 @@ const ROOMINTEL_BUCKET_MS = 5_000;
 // key = `${scraplet_user_id}|${platform}|${channel_slug}`
 const roomIntelBuckets = new Map();
 
+// In-memory persistent gauges per channel (viewers, followers, likes, etc.)
+// These survive across flush cycles.
+const roomIntelGauges = new Map();
+
 function roomIntelKey({ scraplet_user_id, platform, channel_slug }) {
     return `${Number(scraplet_user_id)}|${String(platform)}|${String(channel_slug)}`;
 }
@@ -98,16 +102,29 @@ function pressureFromTripwire(tripwire) {
     return 40; // unknown-but-present
 }
 
+function extractTopEmotes(emoteCounts) {
+    if (!emoteCounts || emoteCounts.size === 0) return [];
+    const sorted = [...emoteCounts.entries()].sort((a, b) => b[1] - a[1]);
+    return sorted.slice(0, 3).map(e => ({ name: e[0], count: e[1] }));
+}
+
 function flushRoomIntelBucket(key, b) {
     try {
         if (!b) return;
 
+        // In v2.0 (event-driven), we flush even if messages === 0, 
+        // because we might have telemetry updates (viewers, etc).
+        // But if there is literally nothing new (no messages + no telemetry in this bucket),
+        // we could skip. But since we only call observation on actual events, 
+        // the existence of a *new* bucket means *something* happened.
+
         const total = b.messages || 0;
-        if (total <= 0) return;
 
         const w = b.r1 * 0.0 + b.r2 * 0.25 + b.r3 * 0.5 + b.r4 * 0.75 + b.r5 * 1.0;
-
         const ei = Math.max(0, Math.min(100, Math.round((w / Math.max(1, total)) * 100)));
+
+        const gauges = roomIntelGauges.get(key) || {};
+        const top_emotes = extractTopEmotes(b.emotes);
 
         const snapshot = {
             scraplet_user_id: b.scraplet_user_id,
@@ -129,6 +146,11 @@ function flushRoomIntelBucket(key, b) {
             pressure: b.pressure ?? null,
             meta: {
                 tripwire: b.tripwire ?? null,
+                viewers: gauges.viewers ?? null,
+                followers: gauges.followers ?? null,
+                likes: gauges.likes ?? null,
+                shares: gauges.shares ?? null,
+                top_emotes: top_emotes.length > 0 ? top_emotes : undefined,
             },
         };
 
@@ -140,23 +162,51 @@ function flushRoomIntelBucket(key, b) {
 }
 
 /**
- * Ingests a normalized event into the Room Intel pipeline.
+ * Update persistent room gauges (viewers, followers, etc.)
  */
-export function observe(event) {
+export function recordTelemetry(event) {
     if (!ROOMINTEL_ENABLED) return;
-
-    // Ingests a normalized event into the Room Intel pipeline.
-    // In v1.7, we count all users (including broadcaster/mods) to ensure the "Pulse"
-    // reflects total room energy and allows easier testing for creators.
-
-    const now = Date.now();
-    const bucketStartMs = Math.floor(now / ROOMINTEL_BUCKET_MS) * ROOMINTEL_BUCKET_MS;
 
     const key = roomIntelKey({
         scraplet_user_id: event.scraplet_user_id,
         platform: event.platform,
         channel_slug: event.channelSlug,
     });
+
+    let g = roomIntelGauges.get(key);
+    if (!g) {
+        g = { viewers: null, followers: null, likes: null, shares: null };
+        roomIntelGauges.set(key, g);
+    }
+
+    let modified = false;
+
+    if (event.viewers !== undefined) {
+        g.viewers = Number(event.viewers);
+        modified = true;
+    }
+    if (event.followers !== undefined) {
+        g.followers = Number(event.followers);
+        modified = true;
+    }
+    if (event.likes !== undefined) {
+        g.likes = Number(event.likes);
+        modified = true;
+    }
+    if (event.shares !== undefined) {
+        g.shares = Number(event.shares);
+        modified = true;
+    }
+
+    // Force a bucket flush tick so this data point is persisted to the graph timeline
+    if (modified) {
+        tickBucketForEvent(event, key);
+    }
+}
+
+function tickBucketForEvent(event, key) {
+    const now = Date.now();
+    const bucketStartMs = Math.floor(now / ROOMINTEL_BUCKET_MS) * ROOMINTEL_BUCKET_MS;
 
     let b = roomIntelBuckets.get(key);
     if (!b || b.bucketStartMs !== bucketStartMs) {
@@ -174,6 +224,7 @@ export function observe(event) {
             r3: 0,
             r4: 0,
             r5: 0,
+            emotes: new Map(), // name -> count
             tripwire: event.__tripwire ?? null,
             pressure: pressureFromTripwire(event.__tripwire),
         };
@@ -182,8 +233,40 @@ export function observe(event) {
     }
 
     // keep latest tripwire/pressure (read-only hint)
-    b.tripwire = event.__tripwire ?? b.tripwire;
-    b.pressure = pressureFromTripwire(b.tripwire);
+    if (event.__tripwire !== undefined) {
+        b.tripwire = event.__tripwire;
+        b.pressure = pressureFromTripwire(b.tripwire);
+    }
+
+    return b;
+}
+
+/**
+ * Ingests a normalized event into the Room Intel pipeline.
+ */
+export function observe(event) {
+    if (!ROOMINTEL_ENABLED) return;
+
+    // Ingests a normalized event into the Room Intel pipeline.
+    // In v1.7, we count all users (including broadcaster/mods) to ensure the "Pulse"
+    // reflects total room energy and allows easier testing for creators.
+
+    const key = roomIntelKey({
+        scraplet_user_id: event.scraplet_user_id,
+        platform: event.platform,
+        channel_slug: event.channelSlug,
+    });
+
+    const b = tickBucketForEvent(event, key);
+
+    // Track emotes for "Mood" detection
+    if (event.meta?.emotes && Array.isArray(event.meta.emotes)) {
+        for (const e of event.meta.emotes) {
+            if (e.name) {
+                b.emotes.set(e.name, (b.emotes.get(e.name) || 0) + 1);
+            }
+        }
+    }
 
     const reg = classifyRegister({
         text: event.text,
@@ -201,5 +284,6 @@ export function observe(event) {
 
 export default {
     observe,
+    recordTelemetry,
     getLiveSnapshot,
 };

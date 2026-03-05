@@ -22,6 +22,30 @@ router.post("/api/inbound/tiktok", async (req, res) => {
         return res.status(400).json({ ok: false, error: "invalid_envelope" });
     }
 
+    const eventType = envelope.eventType || envelope.type || "chat.message.sent";
+    const isChatEvent =
+        eventType === "chat.message.sent" ||
+        eventType === "chat" ||
+        eventType === "chat_message" ||
+        eventType === "message";
+
+    if (!isChatEvent) {
+        // TELEMETRY INTERCEPT
+        if (typeof RoomIntelService.recordTelemetry === "function") {
+            try {
+                RoomIntelService.recordTelemetry({
+                    scraplet_user_id: Number(envelope.scraplet_user_id || envelope.scrapletUserId),
+                    platform: "tiktok",
+                    channelSlug: (envelope.channelSlug || envelope.channel_slug || "").toLowerCase().trim(),
+                    ...(envelope.payload || envelope)
+                });
+            } catch (e) {
+                console.warn("[inboundTiktok] recordTelemetry failed", e?.message || e);
+            }
+        }
+        return res.json({ ok: true, ignored: true, reason: "non_chat_event", eventType });
+    }
+
     // 1. Moderate
     const modResult = await evaluateModeration(envelope);
 

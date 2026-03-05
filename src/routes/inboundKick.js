@@ -723,6 +723,21 @@ router.post("/api/inbound/kick", async (req, res) => {
       eventType === "message";
 
     if (!isChatEvent) {
+      // TELEMETRY INTERCEPT (Viewers, Follows, Subs, etc)
+      // Pass the event payload into recordTelemetry to update persistent gauges
+      if (typeof RoomIntelService.recordTelemetry === "function") {
+        try {
+          RoomIntelService.recordTelemetry({
+            scraplet_user_id: Number(scraplet_user_id),
+            platform: "kick",
+            channelSlug: channelSlug.toLowerCase().trim(),
+            ...payload // Pass through viewers, followers, likes, shares, etc if present
+          });
+        } catch (e) {
+          console.warn("[inboundKick] recordTelemetry failed", e?.message || e);
+        }
+      }
+
       return res
         .status(200)
         .json({ ok: true, ignored: true, reason: "non_chat_event", eventType });
