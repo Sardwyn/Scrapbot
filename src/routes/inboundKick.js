@@ -234,6 +234,8 @@ function normalizeFromChatV1(chat_v1, root = {}) {
     if (role === "broadcaster") badges = ["broadcaster"];
   }
 
+  const emotes = payload.emotes || c.platform_payload?.emotes || null;
+
   return {
     eventType: "chat.message.sent",
     payload,
@@ -245,7 +247,7 @@ function normalizeFromChatV1(chat_v1, root = {}) {
     text,
     message_id,
     badges,
-    meta: { from_chat_v1: true, authorRole: safeStr(c.author?.role || "").toLowerCase() },
+    meta: { from_chat_v1: true, authorRole: safeStr(c.author?.role || "").toLowerCase(), emoji_only: false, emote_only: false, emotes },
     root,
   };
 }
@@ -411,7 +413,7 @@ function normalizeInbound(root = {}) {
     text,
     message_id,
     badges,
-    meta: { emoji_only, emote_only },
+    meta: { emoji_only, emote_only, emotes },
     root,
   };
 }
@@ -731,7 +733,11 @@ router.post("/api/inbound/kick", async (req, res) => {
             scraplet_user_id: Number(scraplet_user_id),
             platform: "kick",
             channelSlug: channelSlug.toLowerCase().trim(),
-            ...payload // Pass through viewers, followers, likes, shares, etc if present
+            viewers: root.viewers ?? payload.viewers ?? undefined,
+            followers: root.followers ?? payload.followers ?? undefined,
+            likes: root.likes ?? payload.likes ?? undefined,
+            shares: root.shares ?? payload.shares ?? undefined,
+            ...payload // Still pass through anything else
           });
         } catch (e) {
           console.warn("[inboundKick] recordTelemetry failed", e?.message || e);
