@@ -12,6 +12,7 @@ import express from "express";
 import { channelPulseTrack } from "../lib/channelPulse.js";
 import { metricsRecordInbound, metricsRecordAudit } from "../lib/metrics.js";
 import { tryHandleSystemCommand } from "../systemCommands.js";
+import { isJoinCommand, handleJoin } from "../workers/raffleManager.js";
 import { evaluateModeration } from "../moderationRuntime.js";
 import { evaluateChatCommand } from "../commandRuntime.js";
 import { loadAllCommands } from "../commandStore.js";
@@ -542,6 +543,24 @@ router.post("/api/inbound/kick", async (req, res) => {
   let moderationDecision = null;
   let commandDecision = null;
   let commandReplySent = false;
+
+  // ── Raffle join command ──────────────────────────────────────────────────
+  // Check before other command processing so !join is handled even if not a system command
+  try {
+    const msgText = event.text || event.message?.text || '';
+    const channelSlug = event.channelSlug || '';
+    if (isJoinCommand(msgText, channelSlug)) {
+      const badges = event.badges || event.message?.raw?.sender?.identity?.badges || [];
+      const result = await handleJoin(channelSlug, event.senderUsername || 'Unknown', badges);
+      if (result.ok) {
+        // Widget updates via SSE — no chat spam needed
+        console.log('[raffle] join:', event.senderUsername, 'in', channelSlug);
+      }
+      return res.status(200).json({ ok: true, raffleJoin: true });
+    }
+  } catch (e) {
+    console.error('[raffle join] failed', e?.message || e);
+  }
 
   // DEBUG: verify if Kick emotes/reactions are present in the inbound payload
   try {

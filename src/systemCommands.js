@@ -1,5 +1,6 @@
 // /src/systemCommands.js
 import { enqueueFreeTTS } from "./ttsClient.js";
+import { startRaffle, rollRaffle, stopRaffle, getRaffleStatus } from "./workers/raffleManager.js";
 import {
   getFreeTTSFeature,
   isFreeTTSEnabled,
@@ -498,6 +499,55 @@ export async function tryHandleSystemCommand(event) {
     console.error("[cmdManager] failed", e?.message || e);
     await saySystem(event, "⚠️ Command manager error.");
     return true;
+  }
+
+  // ------------------------------
+  // Raffle commands (!raffle start|roll|stop|status)
+  // ------------------------------
+  if (raw.toLowerCase().startsWith('!raffle')) {
+    const parts = raw.trim().split(/\s+/);
+    const sub = (parts[1] || '').toLowerCase();
+    const channelSlug = event.channelSlug || '';
+    const ownerUserId = event.scraplet_user_id;
+    const isMod = event.role === 'moderator' || event.role === 'broadcaster' || event.isBroadcaster;
+
+    if (!isMod) {
+      await saySystem(event, '⚠️ Only mods can manage the raffle.');
+      return true;
+    }
+
+    try {
+      if (sub === 'start') {
+        const anim = parts[2] || '';
+        const result = await startRaffle(channelSlug, ownerUserId, anim || undefined);
+        await saySystem(event, result.message);
+        return true;
+      }
+      if (sub === 'roll') {
+        const anim = parts[2] || '';
+        const result = await rollRaffle(channelSlug, anim || undefined);
+        await saySystem(event, result.message);
+        return true;
+      }
+      if (sub === 'stop' || sub === 'end') {
+        const result = await stopRaffle(channelSlug);
+        await saySystem(event, result.message);
+        return true;
+      }
+      if (sub === 'status') {
+        const raffle = getRaffleStatus(channelSlug);
+        if (!raffle) { await saySystem(event, 'No active raffle.'); return true; }
+        await saySystem(event, `Raffle: ${raffle.status}, ${raffle.entrants.size} entries, join with ${raffle.config.joinCommand}`);
+        return true;
+      }
+      // Default: show help
+      await saySystem(event, '!raffle start [wheel|slot|scramble] | !raffle roll | !raffle stop | !raffle status');
+      return true;
+    } catch (e) {
+      console.error('[raffle cmd] failed', e?.message || e);
+      await saySystem(event, '⚠️ Raffle error.');
+      return true;
+    }
   }
 
   // ------------------------------
