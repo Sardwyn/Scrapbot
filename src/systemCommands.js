@@ -645,6 +645,7 @@ export async function tryHandleSystemCommand(event) {
     platform: "kick",
     voicePreset: cfg.voice_preset,
     voiceId,
+    requestedByUsername: event.senderUsername || null,
   });
 
   await maybeSayTTS(event, "Queued ✅");

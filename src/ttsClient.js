@@ -4,6 +4,7 @@ export async function enqueueFreeTTS({
   channelSlug,
   text,
   platform = "kick",
+  requestedByUsername = null,
 }) {
   const base = process.env.DASHBOARD_INTERNAL_URL || "http://127.0.0.1:3000";
   const key = process.env.TTS_FREE_INTERNAL_KEY || "";
@@ -19,6 +20,7 @@ export async function enqueueFreeTTS({
       channelSlug,
       platform,
       text,
+      requestedByUsername,
     }),
   });
 
