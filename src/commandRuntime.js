@@ -1,5 +1,7 @@
 // src/commandRuntime.js
 import { getCommandsFor } from './commandStore.js';
+import { handleMediaCommand } from './workers/mediaQueueManager.js';
+import { handleClipCommand } from './workers/clipManager.js';
 
 // In-memory cooldown tracker: commandId -> lastUsedEpochMs
 const lastUsed = new Map();
@@ -103,12 +105,32 @@ export async function evaluateChatCommand({
   userName,
   userRole, // 'everyone' | 'mod' | 'broadcaster'
   messageText,
+  userId, // Add userId for built-in commands
 }) {
   const platformKey = platform || 'kick';
   const text = (messageText || '').trim();
 
   // MVP: only commands starting with "!"
   if (!text.startsWith('!')) return null;
+
+  // Check for built-in commands first
+  const args = text.slice(1).split(/\s+/);
+  const command = args[0].toLowerCase();
+  const commandArgs = args.slice(1);
+
+  // Built-in media queue commands
+  if (['sr', 'songrequest', 'queue', 'skip', 'clearqueue'].includes(command)) {
+    // Only mods and broadcasters can skip/clear
+    if (['skip', 'clearqueue'].includes(command) && !['mod', 'broadcaster'].includes(userRole)) {
+      return { type: 'text', text: `@${userName} Only mods can use !${command}` };
+    }
+    return await handleMediaCommand(command, channelSlug, userId, userName, commandArgs);
+  }
+
+  // Built-in clip command
+  if (command === 'clip') {
+    return await handleClipCommand(platformKey, channelSlug, userId, userName);
+  }
 
   const commands = getCommandsFor(platformKey, channelSlug) || [];
   const now = Date.now();

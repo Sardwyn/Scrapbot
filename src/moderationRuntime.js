@@ -38,7 +38,7 @@ export async function evaluateModeration({
       return null;
     }
 
-    const rules = getModerationRulesFor(scraplet_user_id, platform);
+    const rules = getModerationRulesFor({ scraplet_user_id, platform, channelSlug });
     if (!Array.isArray(rules) || rules.length === 0) return null;
 
     const msgRaw = text.trim();

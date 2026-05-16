@@ -73,6 +73,11 @@ async function pullWinnerEvents({ url, token, ownerUserId, sinceIso }) {
   });
 
   if (!res.ok) {
+    // Don't throw on 502/503 — dashboard may be restarting, just skip this tick
+    if (res.status === 502 || res.status === 503 || res.status === 504) {
+      console.warn(`[raffleOrch] dashboard unavailable (${res.status}), skipping tick`);
+      return [];
+    }
     throw new Error(`[raffleOrch] pull failed ${res.status}`);
   }
 

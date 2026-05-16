@@ -28,6 +28,7 @@ import { loadAllModerationRules } from "./moderationStore.js";
 
 // 🔥 Orchestration
 import { startRaffleOrchestrator } from "./workers/raffleOrchestrator.js";
+import { startHypeTrainOrchestrator } from "./workers/hypeTrainOrchestrator.js";
 import { startModProbeScheduler } from "./workers/modProbeScheduler.js";
 import "./workers/refresh.js";
 
@@ -79,6 +80,7 @@ console.log("[boot] env", {
 // -----------------------------
 let raffleOrch = null;
 let modProbe = null;
+let hypeTrainOrch = null;
 
 try {
   console.log("[boot] starting raffle orchestrator");
@@ -86,6 +88,14 @@ try {
   console.log("[boot] raffle orchestrator running");
 } catch (err) {
   console.error("[boot] raffle orchestrator FAILED", err);
+}
+
+try {
+  console.log("[boot] starting hype train orchestrator");
+  hypeTrainOrch = startHypeTrainOrchestrator();
+  console.log("[boot] hype train orchestrator running");
+} catch (err) {
+  console.error("[boot] hype train orchestrator FAILED", err);
 }
 
 // -----------------------------
@@ -121,8 +131,9 @@ app.get("/health", (req, res) => {
     service: "scrapbot",
     orchestration: {
       raffle: raffleOrch ? "running" : "not_running",
+      hype_train: hypeTrainOrch ? "running" : "not_running",
       mod_probe: modProbe ? "running" : "not_running",
-      token_refresh: "module_loaded", // side-effect worker
+      token_refresh: "module_loaded",
     },
     time: new Date().toISOString(),
   });

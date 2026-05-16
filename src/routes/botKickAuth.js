@@ -3,13 +3,13 @@
 
 import express from 'express';
 import crypto from 'crypto';
+import Redis from 'ioredis';
 import * as db from '../lib/db.js';
 
 const router = express.Router();
 const q = db.q || db.default?.q;
 
-// Simple PKCE store: state -> { verifier, createdAt }
-const pkceStore = new Map();
+const redisClient = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
 
 function b64url(buf) {
   return Buffer.from(buf)
@@ -87,8 +87,7 @@ router.get('/admin/bot/kick/start', async (req, res) => {
     const state = crypto.randomUUID();
     const now = Date.now();
 
-    pkceStore.set(state, { verifier, createdAt: now });
-    setTimeout(() => pkceStore.delete(state), 10 * 60 * 1000);
+    await redisClient.setex(`bot_kick_pkce:${state}`, 600, JSON.stringify({ verifier, createdAt: now }));
 
     const params = new URLSearchParams({
       response_type: 'code',
@@ -150,7 +149,8 @@ router.get('/admin/bot/kick/callback', async (req, res) => {
   }
 
   const stateStr = state.toString();
-  const pkce = pkceStore.get(stateStr);
+  const pkceRaw = await redisClient.get(`bot_kick_pkce:${stateStr}`);
+  const pkce = pkceRaw ? JSON.parse(pkceRaw) : null;
 
   if (!pkce) {
     console.error(
@@ -160,7 +160,7 @@ router.get('/admin/bot/kick/callback', async (req, res) => {
     return res.status(400).send('Missing PKCE verifier for state');
   }
 
-  pkceStore.delete(stateStr);
+  await redisClient.del(`bot_kick_pkce:${stateStr}`);
 
   try {
     // 1) Exchange code for tokens

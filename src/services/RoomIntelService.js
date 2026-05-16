@@ -5,6 +5,7 @@
 //
 
 import roomIntelStore from "../stores/roomIntelStore.js";
+import { checkForHighlight } from "./highlightDetector.js";
 
 const ROOMINTEL_ENABLED = String(process.env.ROOMINTEL_ENABLED || "1") !== "0";
 const ROOMINTEL_BUCKET_MS = 5_000;
@@ -156,6 +157,9 @@ function flushRoomIntelBucket(key, b) {
 
         // Fire-and-forget; store is already try/catch defensive.
         roomIntelStore.insertSnapshot(snapshot);
+        
+        // Check for highlight moments
+        checkForHighlight(snapshot);
     } catch (e) {
         console.warn("[RoomIntelService] flush failed", e?.message || e);
     }

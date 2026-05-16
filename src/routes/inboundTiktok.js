@@ -49,7 +49,7 @@ router.post("/api/inbound/tiktok", async (req, res) => {
     // 1. Moderate
     const modResult = await evaluateModeration(envelope);
 
-    if (modResult.action === "block" || modResult.action === "ban") {
+    if (modResult && (modResult.action === "block" || modResult.action === "ban")) {
         console.log(`[TikTok] Blocked message from ${envelope.author?.username}`);
         return res.json({ ok: true, action: "block" });
     }
