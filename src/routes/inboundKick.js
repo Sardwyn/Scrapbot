@@ -544,23 +544,6 @@ router.post("/api/inbound/kick", async (req, res) => {
   let commandDecision = null;
   let commandReplySent = false;
 
-  // ── Raffle join command ──────────────────────────────────────────────────
-  // Check before other command processing so !join is handled even if not a system command
-  try {
-    const msgText = event.text || event.message?.text || '';
-    const channelSlug = event.channelSlug || '';
-    if (isJoinCommand(msgText, channelSlug)) {
-      const badges = event.badges || event.message?.raw?.sender?.identity?.badges || [];
-      const result = await handleJoin(channelSlug, event.senderUsername || 'Unknown', badges);
-      if (result.ok) {
-        // Widget updates via SSE — no chat spam needed
-        console.log('[raffle] join:', event.senderUsername, 'in', channelSlug);
-      }
-      return res.status(200).json({ ok: true, raffleJoin: true });
-    }
-  } catch (e) {
-    console.error('[raffle join] failed', e?.message || e);
-  }
 
   // DEBUG: verify if Kick emotes/reactions are present in the inbound payload
   try {
@@ -797,6 +780,24 @@ router.post("/api/inbound/kick", async (req, res) => {
       meta: meta || null,
       __tripwire: null,
     };
+
+    // ── Raffle join command ──────────────────────────────────────────────────
+    // Check before other command processing so !join is handled even if not a system command
+    try {
+      const msgText = event.text || '';
+      const slug = event.channelSlug || '';
+      if (isJoinCommand(msgText, slug)) {
+        const badgesList = event.badges || [];
+        const result = await handleJoin(slug, event.senderUsername || 'Unknown', badgesList);
+        if (result.ok) {
+          // Widget updates via SSE — no chat spam needed
+          console.log('[raffle] join:', event.senderUsername, 'in', slug);
+        }
+        return res.status(200).json({ ok: true, raffleJoin: true });
+      }
+    } catch (e) {
+      console.error('[raffle join] failed', e?.message || e);
+    }
 
     // --------------------------------------------
     // SYSTEM COMMANDS (e.g. !tts)
