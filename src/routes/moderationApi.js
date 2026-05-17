@@ -142,7 +142,7 @@ router.post('/api/moderation/rules', async (req, res) => {
     const priority = asInt(b.priority, 1000);
 
     if (!rule_type) return res.status(400).json({ ok: false, error: 'rule_type required' });
-    if (!rule_value) return res.status(400).json({ ok: false, error: 'rule_value required' });
+    if (!rule_value && rule_type !== 'link_posting') return res.status(400).json({ ok: false, error: 'rule_value required' });
 
     const { rows } = await db.query(
       `

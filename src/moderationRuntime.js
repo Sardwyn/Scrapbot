@@ -58,13 +58,17 @@ export async function evaluateModeration({
 
       const ruleType = String(rule.rule_type || '').toLowerCase().trim();
       const ruleValue = String(rule.rule_value || '').trim();
-      if (!ruleType || !ruleValue) continue;
+      if (!ruleType) continue;
 
-      // Also strip emojis from the rule itself, so emoji rules won't match anything.
-      const ruleValueStripped = stripEmoji(ruleValue);
-      if (!ruleValueStripped) continue;
+      let ruleValueStripped = '';
+      let valueLower = '';
 
-      const valueLower = ruleValueStripped.toLowerCase();
+      if (ruleType !== 'link_posting') {
+        if (!ruleValue) continue;
+        ruleValueStripped = stripEmoji(ruleValue);
+        if (!ruleValueStripped) continue;
+        valueLower = ruleValueStripped.toLowerCase();
+      }
 
       let matched = false;
       let match_reason = '';
