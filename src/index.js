@@ -13,6 +13,8 @@ import channelsRoutes from "./routes/channels.js";
 import botKickAuthRoutes from "./routes/botKickAuth.js";
 import inboundKickRoutes from "./routes/inboundKick.js";
 import inboundTiktokRoutes from "./routes/inboundTiktok.js";
+import inboundTwitchRoutes from "./routes/inboundTwitch.js";
+import inboundYoutubeRoutes from "./routes/inboundYoutube.js";
 
 import moderationApi from "./routes/moderationApi.js";
 import intelApi from "./routes/intelApi.js";
@@ -118,6 +120,8 @@ app.use(metricsRoutes);
 
 app.use(inboundKickRoutes);
 app.use(inboundTiktokRoutes);
+app.use(inboundTwitchRoutes);
+app.use(inboundYoutubeRoutes);
 app.use(moderationApi);
 app.use(intelApi);
 
