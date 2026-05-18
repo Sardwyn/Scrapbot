@@ -551,6 +551,34 @@ export async function tryHandleSystemCommand(event) {
   }
 
   // ------------------------------
+  // Live session stats (!stats)
+  // ------------------------------
+  if (raw.toLowerCase().trim() === '!stats' || raw.toLowerCase().trim() === '@scrapbot stats') {
+    try {
+      const resp = await fetch(`${process.env.DASHBOARD_INTERNAL_URL || 'http://127.0.0.1:3000'}/api/internal/channel-stats/${event.channelSlug}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.live && data.stats) {
+          const s = data.stats;
+          const msg = `Live Stats: ${s.dur}m uptime, ${s.peak || '?'} peak CCV, ${s.msgs || 0} msgs (${s.mpm || 0}/min) from ${s.chatters_count || 0} chatters.`;
+          await saySystem(event, msg);
+          return true;
+        } else {
+          await saySystem(event, "Stream is currently offline.");
+          return true;
+        }
+      } else {
+         await saySystem(event, "Stats API returned an error.");
+         return true;
+      }
+    } catch (e) {
+      console.error('[stats cmd] failed', e?.message || e);
+      await saySystem(event, '⚠️ Could not fetch stats.');
+      return true;
+    }
+  }
+
+  // ------------------------------
   // TTS system command
   // ------------------------------
   const feature = await getFreeTTSFeature({
