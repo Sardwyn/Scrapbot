@@ -17,7 +17,8 @@ router.post("/api/inbound/tiktok", async (req, res) => {
         return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
-    const envelope = req.body;
+    const body = req.body || {};
+    const envelope = body.chat_v1 || body;
     if (!envelope || !envelope.platform) {
         return res.status(400).json({ ok: false, error: "invalid_envelope" });
     }
