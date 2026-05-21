@@ -560,7 +560,12 @@ export async function tryHandleSystemCommand(event) {
         const data = await resp.json();
         if (data.live && data.stats) {
           const s = data.stats;
-          const msg = `Live Stats: ${s.dur}m uptime, ${s.peak || '?'} peak CCV, ${s.msgs || 0} msgs (${s.mpm || 0}/min) from ${s.chatters_count || 0} chatters.`;
+          const dur = s.dur ?? s.session_duration_minutes ?? 0;
+          const peak = s.peak ?? s.peak_viewers ?? '?';
+          const msgs = s.msgs ?? s.total_messages ?? 0;
+          const mpm = s.mpm ?? s.messages_per_minute ?? 0;
+          const chatters = s.chatters_count ?? s.unique_chatters ?? 0;
+          const msg = `Live Stats: ${dur}m uptime, ${peak} peak CCV, ${msgs} msgs (${mpm}/min) from ${chatters} chatters.`;
           await saySystem(event, msg);
           return true;
         } else {
