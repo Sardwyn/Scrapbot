@@ -1,6 +1,6 @@
 // src/lib/sendEventToDashboard.js
 import crypto from "crypto";
-import { createEnvelope } from "./envelope.js";
+import { createEnvelope } from "../lib/envelope.js";
 
 const DASHBOARD_URL =
   process.env.DASHBOARD_EVENT_URL || "https://scraplet.store/api/kick-ingest";

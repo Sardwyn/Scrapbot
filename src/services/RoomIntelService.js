@@ -6,6 +6,7 @@
 
 import roomIntelStore from "../stores/roomIntelStore.js";
 import { checkForHighlight } from "./highlightDetector.js";
+import { sendEventToDashboard } from "../legacy/sendEventToDashboard.js";
 
 const ROOMINTEL_ENABLED = String(process.env.ROOMINTEL_ENABLED || "1") !== "0";
 const ROOMINTEL_BUCKET_MS = 5_000;
@@ -160,6 +161,17 @@ function flushRoomIntelBucket(key, b) {
         
         // Check for highlight moments
         checkForHighlight(snapshot);
+
+        // Forward snapshot to dashboard overlay telemetry ingest
+        sendEventToDashboard({
+            platform: b.platform,
+            type: "room_intel",
+            owner_user_id: b.scraplet_user_id,
+            channel: {
+                slug: b.channel_slug,
+            },
+            payload: snapshot,
+        }).catch(err => console.warn("[RoomIntelService] sendEventToDashboard failed:", err?.message || err));
     } catch (e) {
         console.warn("[RoomIntelService] flush failed", e?.message || e);
     }
